@@ -302,7 +302,7 @@ def fetch_scores(sport):
         return None
 
 
-def fetch_odds(sport):
+def fetch_odds(sport, limit=None):
     """Fetch betting odds from ESPN."""
     sport_path = ODDS_SPORTS.get(sport.lower())
     if not sport_path:
@@ -310,11 +310,21 @@ def fetch_odds(sport):
 
     try:
         url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard"
-        resp = requests.get(url, timeout=10)
+        params = {}
+
+        # For college sports, get all games (not just top 25)
+        if sport.lower() in ('ncaab', 'ncaaf'):
+            params['groups'] = '50'  # All D1 games
+            params['limit'] = '100'
+
+        resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
         games = []
 
-        for event in data.get("events", [])[:8]:
+        # For college sports show more games, otherwise limit to 8
+        max_games = limit or (50 if sport.lower() in ('ncaab', 'ncaaf') else 8)
+
+        for event in data.get("events", [])[:max_games]:
             competition = event.get("competitions", [{}])[0]
             competitors = competition.get("competitors", [])
 
@@ -570,12 +580,24 @@ async def lines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No games/odds found for {query.upper()}")
             return
 
-        lines = [f"*{query.upper()} Lines:*\n"]
-        for game in games:
-            lines.append(format_odds(game))
-            lines.append("")
+        # Build message, split if too long (Telegram 4096 char limit)
+        header = f"*{query.upper()} Lines ({len(games)} games):*\n\n"
+        messages = []
+        current_msg = header
 
-        await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+        for game in games:
+            game_text = format_odds(game) + "\n\n"
+            if len(current_msg) + len(game_text) > 3900:
+                messages.append(current_msg)
+                current_msg = ""
+            current_msg += game_text
+
+        if current_msg:
+            messages.append(current_msg)
+
+        for msg in messages:
+            await update.message.reply_text(msg, parse_mode='Markdown')
+
         return
 
     # Search for team name across sports
