@@ -159,7 +159,7 @@ def parse_parlay_text(text):
     return legs
 
 
-def add_parlay(user_id, user_name, chat_id, stake, legs, source="manual"):
+def add_parlay(user_id, user_name, chat_id, legs, stake=None, source="manual"):
     """Add a new parlay."""
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
@@ -169,18 +169,20 @@ def add_parlay(user_id, user_name, chat_id, stake, legs, source="manual"):
         odds = leg.get('odds', 1.0)
         total_odds *= odds
 
-    try:
-        stake_float = float(str(stake).replace('$', '').replace(',', ''))
-        potential_payout = stake_float * total_odds
-    except:
-        potential_payout = 0
+    potential_payout = ""
+    if stake:
+        try:
+            stake_float = float(str(stake).replace('$', '').replace(',', ''))
+            potential_payout = f"${stake_float * total_odds:.2f}"
+        except:
+            pass
 
     c.execute("""
         INSERT INTO parlays (user_id, user_name, chat_id, stake, total_odds,
                             potential_payout, legs, status, created_at, source)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-    """, (str(user_id), user_name, str(chat_id), str(stake), f"{total_odds:.2f}",
-          f"${potential_payout:.2f}", json.dumps(legs), datetime.now().isoformat(), source))
+    """, (str(user_id), user_name, str(chat_id), str(stake) if stake else None, f"{total_odds:.2f}",
+          potential_payout, json.dumps(legs), datetime.now().isoformat(), source))
     parlay_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -225,26 +227,91 @@ def update_parlay_status(parlay_id, status, result=None):
     conn.close()
 
 
-def format_parlay(parlay):
-    """Format a parlay for display."""
+def format_parlay(parlay, live_data=None):
+    """Format a parlay for display, optionally with live scores."""
     legs = json.loads(parlay['legs']) if isinstance(parlay['legs'], str) else parlay['legs']
 
     lines = [f"*Parlay #{parlay['id']}* - {parlay['user_name']}"]
-    lines.append(f"Stake: {parlay['stake']} → Potential: {parlay['potential_payout']}")
-    lines.append(f"Total Odds: {parlay['total_odds']}x")
-    lines.append("Legs:")
+
+    if parlay.get('stake'):
+        lines.append(f"Stake: {parlay['stake']} → Potential: {parlay['potential_payout']}")
+
+    lines.append(f"Legs ({len(legs)}):")
 
     for i, leg in enumerate(legs, 1):
-        odds_str = f" ({leg.get('odds', '')})" if leg.get('odds') else ""
-        lines.append(f"  {i}. {leg['pick']}{odds_str}")
+        pick = leg['pick']
+        odds_str = f" ({leg.get('odds', '')})" if leg.get('odds') and leg.get('odds') != 1.0 else ""
+
+        # Check for live score data
+        live_info = ""
+        if live_data:
+            for game in live_data:
+                # Match by team name in pick
+                home = game.get('home', '').lower()
+                away = game.get('away', '').lower()
+                pick_lower = pick.lower()
+
+                if home in pick_lower or away in pick_lower or \
+                   any(word in pick_lower for word in home.split()) or \
+                   any(word in pick_lower for word in away.split()):
+                    score = game.get('score', '')
+                    status = game.get('status', '')
+                    if score:
+                        live_info = f" → {score} ({status})"
+                    elif status:
+                        live_info = f" → {status}"
+                    break
+
+        lines.append(f"  {i}. {pick}{odds_str}{live_info}")
 
     status = parlay['status']
     if status == 'won':
-        lines.append(f"*WON {parlay['potential_payout']}!*")
+        lines.append(f"\n*WON!*")
     elif status == 'lost':
-        lines.append(f"*LOST*")
+        lines.append(f"\n*LOST*")
+    elif status == 'open' and live_data:
+        lines.append(f"\n_Live tracking enabled_")
 
     return "\n".join(lines)
+
+
+def fetch_all_live_games():
+    """Fetch live games from all major sports."""
+    all_games = []
+
+    for sport, url in ESPN_SCOREBOARD.items():
+        try:
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+
+            for event in data.get('events', []):
+                competition = event.get('competitions', [{}])[0]
+                competitors = competition.get('competitors', [])
+
+                if len(competitors) >= 2:
+                    home = competitors[0]
+                    away = competitors[1]
+
+                    status_data = event.get('status', {}).get('type', {})
+
+                    game = {
+                        'sport': sport,
+                        'home': home.get('team', {}).get('displayName', ''),
+                        'home_abbrev': home.get('team', {}).get('abbreviation', ''),
+                        'away': away.get('team', {}).get('displayName', ''),
+                        'away_abbrev': away.get('team', {}).get('abbreviation', ''),
+                        'home_score': home.get('score', '0'),
+                        'away_score': away.get('score', '0'),
+                        'status': status_data.get('shortDetail', ''),
+                        'state': status_data.get('state', ''),  # pre, in, post
+                        'completed': status_data.get('completed', False),
+                    }
+                    game['score'] = f"{game['away_abbrev']} {game['away_score']} - {game['home_abbrev']} {game['home_score']}"
+                    all_games.append(game)
+        except Exception as e:
+            logger.error(f"Error fetching {sport} scores: {e}")
+
+    return all_games
 
 
 # ESPN API
@@ -440,20 +507,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command."""
     await update.message.reply_text(
-        "*Bet Tracker Bot Commands*\n\n"
-        "*Parlays:*\n"
-        "/parlay $20 - Start a parlay, then send legs:\n"
-        "```\nLakers ML +150\nChiefs -3 -110\n```\n"
+        "*Parlay Tracker Bot*\n\n"
+        "*Track Your Parlays:*\n"
+        "/parlay - Start a parlay, then send legs:\n"
+        "```\nLakers ML\nChiefs -3\nOver 220\n```\n"
+        "/check - See live scores for your picks!\n"
         "/parlays - Your open parlays\n"
         "/parlay\\_won <id> - Mark as won\n"
         "/parlay\\_lost <id> - Mark as lost\n\n"
         "*Scores & Lines:*\n"
-        "/scores nba - NBA scores\n"
-        "/scores nfl - NFL scores\n"
-        "/lines nba - NBA betting lines/odds\n"
-        "/lines lakers - Search team lines\n\n"
+        "/scores nba - Live scores\n"
+        "/lines nba - Betting lines/odds\n"
+        "/lines lakers - Search team\n\n"
         "*Screenshots:*\n"
-        "Upload a betting slip image and I'll try to read it!\n",
+        "Upload a betting slip image to track it!\n",
         parse_mode='Markdown'
     )
 
@@ -463,24 +530,24 @@ async def parlay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # Check for stake in args
+    # Check for optional stake in args
+    stake = None
     if context.args:
         stake_str = ' '.join(context.args)
         stake_match = re.search(r'\$?(\d+(?:\.\d{2})?)', stake_str)
         if stake_match:
             stake = stake_match.group(1)
             context.user_data['pending_parlay_stake'] = stake
-            await update.message.reply_text(
-                f"Got it! Creating a ${stake} parlay.\n\n"
-                f"Now send me your legs, one per line:\n"
-                f"```\nLakers ML +150\nChiefs -3 -110\nOver 48.5 -110\n```",
-                parse_mode='Markdown'
-            )
-            return
 
+    context.user_data['pending_parlay'] = True
+
+    stake_msg = f" (${stake} stake)" if stake else ""
     await update.message.reply_text(
-        "Usage: /parlay $20\n"
-        "Then send your legs in the next message."
+        f"Creating a parlay{stake_msg}.\n\n"
+        f"Send me your legs, one per line:\n"
+        f"```\nLakers ML\nChiefs -3\nOver 48.5\n```\n"
+        f"Use /check to see live scores for your picks!",
+        parse_mode='Markdown'
     )
 
 
@@ -490,12 +557,52 @@ async def parlays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parlays = get_user_parlays(user_id)
 
     if not parlays:
-        await update.message.reply_text("You have no open parlays! Create one with /parlay $20")
+        await update.message.reply_text("You have no open parlays! Create one with /parlay")
         return
 
     lines = ["*Your Open Parlays:*\n"]
     for parlay in parlays:
         lines.append(format_parlay(parlay))
+        lines.append("")
+
+    lines.append("_Use /check to see live scores!_")
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /check command - show parlays with live scores."""
+    user_id = update.effective_user.id
+
+    # Check specific parlay or all
+    parlay_id = None
+    if context.args:
+        try:
+            parlay_id = int(context.args[0])
+        except ValueError:
+            pass
+
+    await update.message.reply_text("Fetching live scores...")
+
+    # Get live games
+    live_games = fetch_all_live_games()
+
+    if parlay_id:
+        parlay = get_parlay(parlay_id)
+        if not parlay:
+            await update.message.reply_text(f"Parlay #{parlay_id} not found!")
+            return
+        parlays = [parlay]
+    else:
+        parlays = get_user_parlays(user_id)
+
+    if not parlays:
+        await update.message.reply_text("You have no open parlays!")
+        return
+
+    lines = [f"*Live Parlay Status* ({len(live_games)} games tracked)\n"]
+
+    for parlay in parlays:
+        lines.append(format_parlay(parlay, live_data=live_games))
         lines.append("")
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
@@ -636,29 +743,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     # Check if user has a pending parlay
-    if 'pending_parlay_stake' in context.user_data:
-        stake = context.user_data.pop('pending_parlay_stake')
+    if context.user_data.get('pending_parlay'):
+        context.user_data.pop('pending_parlay', None)
+        stake = context.user_data.pop('pending_parlay_stake', None)
+
         legs = parse_parlay_text(text)
 
         if not legs:
             await update.message.reply_text(
                 "Couldn't parse any legs. Format:\n"
-                "```\nPick +odds\nPick -odds\n```",
+                "```\nLakers ML\nChiefs -3\nOver 220\n```",
                 parse_mode='Markdown'
             )
             return
 
-        parlay_id = add_parlay(user.id, user.first_name, chat_id, f"${stake}", legs)
+        parlay_id = add_parlay(user.id, user.first_name, chat_id, legs, stake=stake)
         parlay = get_parlay(parlay_id)
 
+        # Fetch live scores to show with the parlay
+        live_games = fetch_all_live_games()
+
         await update.message.reply_text(
-            f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay)}",
+            f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay, live_data=live_games)}\n\n"
+            f"Use /check to see live updates!",
             parse_mode='Markdown'
         )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle photo uploads (betting slip screenshots)."""
+    logger.info("Photo received!")
     user = update.effective_user
     chat_id = update.effective_chat.id
 
@@ -744,6 +858,7 @@ def main():
     app.add_handler(CommandHandler("parlay_lost", parlay_lost))
     app.add_handler(CommandHandler("scores", scores_command))
     app.add_handler(CommandHandler("lines", lines_command))
+    app.add_handler(CommandHandler("check", check_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
