@@ -567,27 +567,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def parlay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /parlay command."""
+    """Handle /parlay command - can include picks inline."""
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # Check for optional stake in args
-    stake = None
-    if context.args:
-        stake_str = ' '.join(context.args)
-        stake_match = re.search(r'\$?(\d+(?:\.\d{2})?)', stake_str)
-        if stake_match:
-            stake = stake_match.group(1)
-            context.user_data['pending_parlay_stake'] = stake
+    # Get full message text after /parlay
+    full_text = update.message.text
+    # Remove the /parlay command itself
+    picks_text = re.sub(r'^/parlay\s*', '', full_text, flags=re.IGNORECASE).strip()
 
-    context.user_data['pending_parlay'] = True
+    # If picks were included with the command, create the parlay
+    if picks_text:
+        legs = parse_parlay_text(picks_text)
 
-    stake_msg = f" (${stake} stake)" if stake else ""
+        if legs:
+            parlay_id = add_parlay(user.id, user.first_name, chat_id, legs)
+            parlay = get_parlay(parlay_id)
+            live_games = fetch_all_live_games()
+
+            await update.message.reply_text(
+                f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay, live_data=live_games)}\n\n"
+                f"/check for live scores",
+                parse_mode='Markdown'
+            )
+            return
+
+    # No picks provided, show help
     await update.message.reply_text(
-        f"Creating a parlay{stake_msg}.\n\n"
-        f"Send me your legs, one per line:\n"
-        f"```\nLakers ML\nChiefs -3\nOver 48.5\n```\n"
-        f"Use /check to see live scores for your picks!",
+        "Just send me your picks!\n\n"
+        "Examples:\n"
+        "`Lakers ML, Chiefs -3, Over 220`\n\n"
+        "Or:\n"
+        "```\nLakers ML\nChiefs -3\nOver 220\n```\n\n"
+        "I'll auto-create a parlay from your picks.",
         parse_mode='Markdown'
     )
 
@@ -806,55 +818,25 @@ def looks_like_picks(text):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle regular text messages."""
+    """Handle regular text messages - auto-detect picks."""
     text = update.message.text
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # Check if user has a pending parlay
-    if context.user_data.get('pending_parlay'):
-        context.user_data.pop('pending_parlay', None)
-        stake = context.user_data.pop('pending_parlay_stake', None)
+    # Try to parse as picks
+    legs = parse_parlay_text(text)
 
-        legs = parse_parlay_text(text)
-
-        if not legs:
-            await update.message.reply_text(
-                "Couldn't parse those picks. Try:\n"
-                "`Lakers ML, Chiefs -3, Over 220`\n"
-                "or one per line",
-                parse_mode='Markdown'
-            )
-            return
-
-        parlay_id = add_parlay(user.id, user.first_name, chat_id, legs, stake=stake)
+    # If we got at least one leg, create a parlay
+    if legs and len(legs) >= 1:
+        parlay_id = add_parlay(user.id, user.first_name, chat_id, legs)
         parlay = get_parlay(parlay_id)
-
-        # Fetch live scores to show with the parlay
         live_games = fetch_all_live_games()
 
         await update.message.reply_text(
             f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay, live_data=live_games)}\n\n"
-            f"Use /check to see live updates!",
+            f"/check for live scores",
             parse_mode='Markdown'
         )
-        return
-
-    # Auto-detect: if message looks like picks, offer to create parlay
-    if looks_like_picks(text):
-        legs = parse_parlay_text(text)
-
-        if legs and len(legs) >= 1:
-            # Auto-create the parlay
-            parlay_id = add_parlay(user.id, user.first_name, chat_id, legs)
-            parlay = get_parlay(parlay_id)
-            live_games = fetch_all_live_games()
-
-            await update.message.reply_text(
-                f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay, live_data=live_games)}\n\n"
-                f"/check for live scores | /parlay\\_lost {parlay_id} if wrong",
-                parse_mode='Markdown'
-            )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
