@@ -262,6 +262,14 @@ ODDS_SPORTS = {
     'nhl': 'hockey/nhl',
     'ncaab': 'basketball/mens-college-basketball',
     'ncaaf': 'football/college-football',
+    'soccer': 'soccer/usa.1',
+    'mls': 'soccer/usa.1',
+    'epl': 'soccer/eng.1',
+    'laliga': 'soccer/esp.1',
+    'bundesliga': 'soccer/ger.1',
+    'seriea': 'soccer/ita.1',
+    'ligue1': 'soccer/fra.1',
+    'ucl': 'soccer/uefa.champions',
 }
 
 
