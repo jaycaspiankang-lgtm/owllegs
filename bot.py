@@ -1506,19 +1506,27 @@ def parse_betting_slip_ocr(ocr_text_lines):
 @app.event("message")
 def handle_message(event, say, client):
     """Handle regular messages, including file uploads."""
-    # Check if this message has files and mentions the bot
+    # Check if this message has files
     files = event.get("files", [])
     text = event.get("text", "")
     user_id = event.get("user")
     channel_id = event.get("channel")
+    subtype = event.get("subtype")
+
+    # Log for debugging
+    if files:
+        logger.info(f"Message with files received: {len(files)} files, text: {text[:50] if text else 'none'}")
+
+    # Skip bot messages and message_changed events
+    if subtype in ("bot_message", "message_changed", "message_deleted"):
+        return
 
     if not files:
         return
 
-    # Check if it looks like a parlay request
-    text_lower = text.lower()
-    if not any(word in text_lower for word in ['parlay', 'bet', 'slip', 'ticket']):
-        return
+    # Any image upload we'll try to process as a betting slip
+    # User can include stake in message like "$20" or "parlay $50"
+    logger.info(f"Processing file upload from {user_id}")
 
     # Look for stake amount in the message
     stake_match = re.search(r'\$(\d+(?:\.\d{2})?)', text)

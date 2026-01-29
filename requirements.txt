@@ -3,3 +3,4 @@ slack-sdk
 requests
 easyocr
 pillow
+python-telegram-bot
