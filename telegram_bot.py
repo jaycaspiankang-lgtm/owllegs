@@ -127,22 +127,56 @@ def parse_odds(odds_str):
 
 
 def parse_parlay_text(text):
-    """Parse parlay legs from text input."""
+    """Parse parlay legs from text input. Very forgiving parser."""
     legs = []
-    lines = text.strip().split('\n')
+
+    # Normalize the text
+    text = text.strip()
+
+    # Split by newlines first
+    lines = text.split('\n')
+
+    # If only one line, try splitting by commas or common separators
+    if len(lines) == 1:
+        # Check for comma-separated
+        if ',' in text:
+            lines = [l.strip() for l in text.split(',')]
+        # Check for semicolon-separated
+        elif ';' in text:
+            lines = [l.strip() for l in text.split(';')]
 
     for line in lines:
         line = line.strip()
-        if not line or line.startswith('#') or line.startswith('/'):
+        if not line:
+            continue
+
+        # Skip commands and comments
+        if line.startswith('/') or line.startswith('#'):
+            continue
+
+        # Remove common prefixes: numbers, bullets, dashes
+        line = re.sub(r'^[\d]+[.\)]\s*', '', line)  # "1. " or "1) "
+        line = re.sub(r'^[-•*]\s*', '', line)  # "- " or "• " or "* "
+        line = re.sub(r'^leg\s*\d*:?\s*', '', line, flags=re.IGNORECASE)  # "Leg 1:" etc
+
+        line = line.strip()
+        if not line:
+            continue
+
+        # Skip obvious non-picks
+        skip_words = ['parlay', 'total', 'wager', 'stake', 'bet', 'slip']
+        if any(line.lower() == word for word in skip_words):
             continue
 
         leg = {'pick': line, 'odds': 1.0}
 
+        # Try to extract odds from various formats
         odds_patterns = [
-            r'([+-]\d+)\s*$',
-            r'@\s*([+-]?\d+\.?\d*)\s*$',
-            r'\(([+-]?\d+\.?\d*)\)\s*$',
-            r'\s(\d+\.\d+)\s*$',
+            r'([+-]\d{3})\s*$',  # American odds: +150, -110
+            r'([+-]\d+)\s*$',  # Shorter American: +15, -11
+            r'@\s*([+-]?\d+\.?\d*)\s*$',  # @ 1.95
+            r'\(([+-]?\d+\.?\d*)\)\s*$',  # (1.95) or (+150)
+            r'\s(\d+\.\d{2})\s*$',  # Decimal: 1.95
         ]
 
         for pattern in odds_patterns:
@@ -153,7 +187,14 @@ def parse_parlay_text(text):
                 leg['pick'] = line[:match.start()].strip()
                 break
 
-        if leg['pick']:
+        # Clean up the pick text
+        pick = leg['pick'].strip()
+
+        # Remove trailing punctuation
+        pick = re.sub(r'[,;:]+$', '', pick).strip()
+
+        if pick and len(pick) >= 2:
+            leg['pick'] = pick
             legs.append(leg)
 
     return legs
@@ -736,6 +777,34 @@ async def lines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 
+def looks_like_picks(text):
+    """Check if text looks like betting picks."""
+    text_lower = text.lower()
+
+    # Common betting keywords
+    pick_keywords = [
+        'ml', 'moneyline', 'spread', 'over', 'under', 'o/u',
+        'pts', 'points', 'win', 'cover', '+', '-',
+        'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'nets',  # NBA
+        'chiefs', 'eagles', 'cowboys', 'bills', 'ravens', '49ers',  # NFL
+        'yankees', 'dodgers', 'braves', 'astros', 'mets',  # MLB
+    ]
+
+    # Check for keywords
+    if any(kw in text_lower for kw in pick_keywords):
+        return True
+
+    # Multiple lines often means picks
+    if text.count('\n') >= 1:
+        return True
+
+    # Comma-separated items
+    if text.count(',') >= 1:
+        return True
+
+    return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular text messages."""
     text = update.message.text
@@ -751,8 +820,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not legs:
             await update.message.reply_text(
-                "Couldn't parse any legs. Format:\n"
-                "```\nLakers ML\nChiefs -3\nOver 220\n```",
+                "Couldn't parse those picks. Try:\n"
+                "`Lakers ML, Chiefs -3, Over 220`\n"
+                "or one per line",
                 parse_mode='Markdown'
             )
             return
@@ -768,6 +838,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Use /check to see live updates!",
             parse_mode='Markdown'
         )
+        return
+
+    # Auto-detect: if message looks like picks, offer to create parlay
+    if looks_like_picks(text):
+        legs = parse_parlay_text(text)
+
+        if legs and len(legs) >= 1:
+            # Auto-create the parlay
+            parlay_id = add_parlay(user.id, user.first_name, chat_id, legs)
+            parlay = get_parlay(parlay_id)
+            live_games = fetch_all_live_games()
+
+            await update.message.reply_text(
+                f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay, live_data=live_games)}\n\n"
+                f"/check for live scores | /parlay\\_lost {parlay_id} if wrong",
+                parse_mode='Markdown'
+            )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
