@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Database
-DATABASE = "/Users/jaykang/Documents/slackbot/bets.db"
+DATABASE = "/Users/jaykang/Documents/owllegs/bets.db"
 
 
 def init_db():
@@ -58,6 +58,23 @@ def init_db():
             created_at TEXT,
             resolved_at TEXT,
             created_by TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS parlays (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            user_name TEXT,
+            channel_id TEXT,
+            stake TEXT,
+            total_odds TEXT,
+            potential_payout TEXT,
+            legs TEXT,
+            status TEXT DEFAULT 'open',
+            result TEXT,
+            created_at TEXT,
+            resolved_at TEXT,
+            source TEXT
         )
     """)
     conn.commit()
@@ -290,6 +307,176 @@ def get_user_history(user_id, limit=15):
     return [dict(row) for row in rows]
 
 
+# Parlay functions
+import json
+
+
+def add_parlay(user_id, user_name, channel_id, stake, legs, source="manual"):
+    """Add a new parlay to track."""
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+
+    # Calculate total odds (multiply all leg odds)
+    total_odds = 1.0
+    for leg in legs:
+        odds = leg.get('odds', 1.0)
+        if isinstance(odds, str):
+            odds = parse_odds(odds)
+        total_odds *= odds
+
+    # Calculate potential payout
+    try:
+        stake_float = float(str(stake).replace('$', '').replace(',', ''))
+        potential_payout = stake_float * total_odds
+    except:
+        potential_payout = 0
+
+    c.execute("""
+        INSERT INTO parlays (user_id, user_name, channel_id, stake, total_odds,
+                            potential_payout, legs, status, created_at, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+    """, (user_id, user_name, channel_id, str(stake), f"{total_odds:.2f}",
+          f"${potential_payout:.2f}", json.dumps(legs), datetime.now().isoformat(), source))
+    parlay_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return parlay_id
+
+
+def get_user_parlays(user_id, status='open'):
+    """Get parlays for a user."""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if status:
+        c.execute("SELECT * FROM parlays WHERE user_id = ? AND status = ? ORDER BY created_at DESC",
+                  (user_id, status))
+    else:
+        c.execute("SELECT * FROM parlays WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_parlay(parlay_id):
+    """Get a specific parlay."""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM parlays WHERE id = ?", (parlay_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_parlay_status(parlay_id, status, result=None):
+    """Update parlay status (won/lost/pushed)."""
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("""
+        UPDATE parlays SET status = ?, result = ?, resolved_at = ?
+        WHERE id = ?
+    """, (status, result, datetime.now().isoformat(), parlay_id))
+    conn.commit()
+    conn.close()
+
+
+def parse_odds(odds_str):
+    """Parse American or decimal odds to decimal multiplier."""
+    odds_str = str(odds_str).strip()
+
+    # Already decimal (e.g., "2.5", "1.91")
+    if '.' in odds_str and not odds_str.startswith(('+', '-')):
+        try:
+            return float(odds_str)
+        except:
+            pass
+
+    # American odds
+    try:
+        odds_int = int(odds_str.replace('+', ''))
+        if odds_int > 0:
+            # Positive American odds: +150 means bet $100 to win $150
+            return 1 + (odds_int / 100)
+        else:
+            # Negative American odds: -150 means bet $150 to win $100
+            return 1 + (100 / abs(odds_int))
+    except:
+        pass
+
+    return 1.0  # Default if can't parse
+
+
+def parse_parlay_text(text):
+    """Parse parlay legs from text input."""
+    legs = []
+    lines = text.strip().split('\n')
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        # Try to parse: "Team/Pick odds" or "Team/Pick @ odds" or "Team/Pick (odds)"
+        # Common formats:
+        # - Lakers ML +150
+        # - Lakers -3.5 -110
+        # - Over 220.5 -110
+        # - Chiefs to win +200
+
+        leg = {'pick': line, 'odds': 1.0}
+
+        # Look for odds at the end
+        odds_patterns = [
+            r'([+-]\d+)\s*$',  # American odds at end: +150, -110
+            r'@\s*([+-]?\d+\.?\d*)\s*$',  # @ odds
+            r'\(([+-]?\d+\.?\d*)\)\s*$',  # (odds)
+            r'\s(\d+\.\d+)\s*$',  # Decimal odds: 2.50
+        ]
+
+        for pattern in odds_patterns:
+            match = re.search(pattern, line)
+            if match:
+                odds_str = match.group(1)
+                leg['odds'] = parse_odds(odds_str)
+                leg['pick'] = line[:match.start()].strip()
+                break
+
+        if leg['pick']:
+            legs.append(leg)
+
+    return legs
+
+
+def format_parlay(parlay):
+    """Format a parlay for display."""
+    legs = json.loads(parlay['legs']) if isinstance(parlay['legs'], str) else parlay['legs']
+
+    lines = [f"*Parlay #{parlay['id']}* - {parlay['user_name']}"]
+    lines.append(f"Stake: {parlay['stake']} → Potential: {parlay['potential_payout']}")
+    lines.append(f"Total Odds: {parlay['total_odds']}x")
+    lines.append("Legs:")
+
+    for i, leg in enumerate(legs, 1):
+        odds_str = f" ({leg.get('odds', '')})" if leg.get('odds') else ""
+        status_icon = ""
+        if leg.get('status') == 'won':
+            status_icon = " ✓"
+        elif leg.get('status') == 'lost':
+            status_icon = " ✗"
+        lines.append(f"  {i}. {leg['pick']}{odds_str}{status_icon}")
+
+    status = parlay['status']
+    if status == 'won':
+        lines.append(f"*WON {parlay['potential_payout']}!*")
+    elif status == 'lost':
+        lines.append(f"*LOST*")
+    elif status == 'pushed':
+        lines.append(f"*PUSHED*")
+
+    return "\n".join(lines)
+
+
 # ESPN API for odds (they have betting data now)
 ODDS_SPORTS = {
     'nba': 'basketball/nba',
@@ -384,6 +571,101 @@ def format_odds(game):
     if game.get("details"):
         lines.append(f"  {game['details']}")
 
+    return "\n".join(lines)
+
+
+# Kalshi Prediction Market API
+KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+
+
+def fetch_kalshi_markets(limit=200, status="open"):
+    """Fetch markets from Kalshi."""
+    try:
+        url = f"{KALSHI_API_BASE}/markets"
+        params = {"limit": limit, "status": status}
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+        return data.get("markets", [])
+    except Exception as e:
+        logger.error(f"Error fetching Kalshi markets: {e}")
+        return None
+
+
+def search_kalshi_markets(query, limit=10):
+    """Search Kalshi markets by keyword."""
+    markets = fetch_kalshi_markets(limit=500)
+    if not markets:
+        return None
+
+    query_lower = query.lower()
+    query_words = query_lower.split()
+
+    matches = []
+    for market in markets:
+        ticker = market.get("ticker", "").lower()
+        event_ticker = market.get("event_ticker", "").lower()
+        yes_title = market.get("yes_sub_title", "").lower()
+        no_title = market.get("no_sub_title", "").lower()
+
+        # Check if any query word matches
+        searchable = f"{ticker} {event_ticker} {yes_title} {no_title}"
+        if all(word in searchable for word in query_words):
+            matches.append(market)
+
+    # Sort by volume (most active first)
+    matches.sort(key=lambda m: float(m.get("volume_24h_fp", "0") or "0"), reverse=True)
+    return matches[:limit]
+
+
+def format_kalshi_market(market):
+    """Format a Kalshi market for Slack display."""
+    ticker = market.get("ticker", "")
+    yes_title = market.get("yes_sub_title", ticker)
+
+    # Get prices (convert from decimal string to percentage)
+    yes_ask = market.get("yes_ask_dollars")
+    yes_bid = market.get("yes_bid_dollars")
+    last_price = market.get("last_price_dollars")
+
+    # Format price as percentage
+    if last_price:
+        try:
+            price_pct = float(last_price) * 100
+            price_str = f"{price_pct:.0f}%"
+        except:
+            price_str = "N/A"
+    elif yes_ask:
+        try:
+            price_pct = float(yes_ask) * 100
+            price_str = f"{price_pct:.0f}%"
+        except:
+            price_str = "N/A"
+    else:
+        price_str = "N/A"
+
+    # Volume
+    vol_24h = market.get("volume_24h_fp", "0")
+    try:
+        vol_str = f"${float(vol_24h):,.0f}"
+    except:
+        vol_str = "$0"
+
+    # Bid/ask spread
+    spread_str = ""
+    if yes_bid and yes_ask:
+        try:
+            bid_pct = float(yes_bid) * 100
+            ask_pct = float(yes_ask) * 100
+            spread_str = f" (bid {bid_pct:.0f}¢ / ask {ask_pct:.0f}¢)"
+        except:
+            pass
+
+    lines = [
+        f"*{yes_title}*",
+        f"  Yes: {price_str}{spread_str}",
+        f"  24h Vol: {vol_str}",
+        f"  `{ticker}`"
+    ]
     return "\n".join(lines)
 
 
@@ -644,6 +926,10 @@ def handle_mention(event, say, client):
 • `shame` - Wall of shame (worst records)
 • `scores nba/nfl/soccer` - Sports scores
 • `lines nba/nfl/mlb` - Betting odds/spreads
+• `kalshi <query>` - Prediction markets
+• `parlay $amt` + legs - Track a parlay
+• `parlays` - Your open parlays
+• `parlay <id> won/lost` - Mark result
 • `settle <id> @winner` - Settle a bet
 • `cancel <id>` - Cancel a bet
 • `help` - Full help""")
@@ -656,6 +942,12 @@ def handle_mention(event, say, client):
 `@betbot @alice vs @bob $50 on the game`
 `@betbot I bet @bob 50 Lakers win`
 
+*Track a parlay:*
+```@betbot parlay $20
+Lakers ML +150
+Chiefs -3 -110
+Over 220.5 -110```
+
 *Commands:*
 - `@betbot list` - Show open bets in this channel
 - `@betbot listall` - Show all open bets
@@ -665,10 +957,16 @@ def handle_mention(event, say, client):
 - `@betbot scores <nba|nfl|soccer|epl>` - Show recent scores
 - `@betbot check` - Auto-match bets to game results
 - `@betbot lines <sport>` - Betting lines (nba/nfl/mlb/nhl/soccer)
+- `@betbot kalshi <query>` - Search Kalshi prediction markets
+- `@betbot parlays` - Show your open parlays
+- `@betbot parlay <id> won` - Mark parlay as won
+- `@betbot parlay <id> lost` - Mark parlay as lost
 - `@betbot balance` - Check your balance
 - `@betbot balances` - Show everyone's balances
 - `@betbot myhistory` - Show your bet history
-- `@betbot help` - Show this help""")
+- `@betbot help` - Show this help
+
+_Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
         return
 
     if clean_text in ("list", "bets", "open", "openbets", "open bets"):
@@ -829,6 +1127,97 @@ def handle_mention(event, say, client):
         say("\n".join(lines))
         return
 
+    # Parlay commands
+    if clean_text in ("parlay", "parlays", "myparlay", "myparlays", "my parlays"):
+        parlays = get_user_parlays(user_id, status='open')
+        if not parlays:
+            say("You have no open parlays! Add one with:\n`@betbot parlay add $10`\nThen list your legs (one per line)")
+        else:
+            lines = ["*Your Open Parlays:*\n"]
+            for parlay in parlays:
+                lines.append(format_parlay(parlay))
+                lines.append("")
+            say("\n".join(lines))
+        return
+
+    if clean_text in ("parlay history", "parlays history", "parlay all"):
+        parlays = get_user_parlays(user_id, status=None)
+        if not parlays:
+            say("You have no parlay history!")
+        else:
+            lines = ["*Your Parlay History:*\n"]
+            for parlay in parlays[:10]:
+                lines.append(format_parlay(parlay))
+                lines.append("")
+            say("\n".join(lines))
+        return
+
+    # Parlay add command
+    parlay_add_match = re.match(r'parlay\s+(?:add|new|create)\s+\$?(\d+(?:\.\d{2})?)\s*(.*)', clean_text, re.DOTALL)
+    if parlay_add_match:
+        stake = parlay_add_match.group(1)
+        legs_text = parlay_add_match.group(2).strip()
+
+        if not legs_text:
+            say(f"Got it! Adding a ${stake} parlay. Now reply with your legs, one per line:\n```\nLakers ML +150\nChiefs -3 -110\nOver 48.5 -110\n```")
+            # Store pending parlay in memory (simple approach)
+            return
+
+        legs = parse_parlay_text(legs_text)
+        if not legs:
+            say("Couldn't parse any legs. Format each leg like:\n`Team/Pick +odds` or `Team/Pick -odds`")
+            return
+
+        user_name = get_user_name(client, user_id)
+        parlay_id = add_parlay(user_id, user_name, channel_id, f"${stake}", legs)
+
+        parlay = get_parlay(parlay_id)
+        say(f"Parlay #{parlay_id} added!\n\n{format_parlay(parlay)}")
+        return
+
+    # Parlay with multiline (when someone posts legs after "parlay add")
+    parlay_multiline_match = re.match(r'parlay\s+\$?(\d+(?:\.\d{2})?)\s*\n(.+)', text.replace(f'<@{bot_user_id}>', '').strip(), re.DOTALL | re.IGNORECASE)
+    if parlay_multiline_match:
+        stake = parlay_multiline_match.group(1)
+        legs_text = parlay_multiline_match.group(2).strip()
+
+        legs = parse_parlay_text(legs_text)
+        if not legs:
+            say("Couldn't parse any legs. Format each leg like:\n`Team/Pick +odds` or `Team/Pick -odds`")
+            return
+
+        user_name = get_user_name(client, user_id)
+        parlay_id = add_parlay(user_id, user_name, channel_id, f"${stake}", legs)
+
+        parlay = get_parlay(parlay_id)
+        say(f"Parlay #{parlay_id} added!\n\n{format_parlay(parlay)}")
+        return
+
+    # Parlay won/lost commands
+    parlay_result_match = re.match(r'parlay\s+(\d+)\s+(won|win|lost|lose|push|pushed)', clean_text)
+    if parlay_result_match:
+        parlay_id = int(parlay_result_match.group(1))
+        result = parlay_result_match.group(2).lower()
+
+        parlay = get_parlay(parlay_id)
+        if not parlay:
+            say(f"Parlay #{parlay_id} not found!")
+            return
+        if parlay['user_id'] != user_id:
+            say("You can only update your own parlays!")
+            return
+
+        if result in ('won', 'win'):
+            update_parlay_status(parlay_id, 'won', parlay['potential_payout'])
+            say(f"Parlay #{parlay_id} marked as WON! You won {parlay['potential_payout']}!")
+        elif result in ('lost', 'lose'):
+            update_parlay_status(parlay_id, 'lost')
+            say(f"Parlay #{parlay_id} marked as LOST. Better luck next time!")
+        else:
+            update_parlay_status(parlay_id, 'pushed')
+            say(f"Parlay #{parlay_id} marked as PUSHED.")
+        return
+
     # Scores command
     scores_match = re.match(r'scores?\s*(\w+)?', clean_text)
     if scores_match:
@@ -895,6 +1284,44 @@ def handle_mention(event, say, client):
         for game in matching:
             lines.append(f"_{game.get('sport', '')}:_")
             lines.append(format_odds(game))
+            lines.append("")
+
+        say("\n".join(lines))
+        return
+
+    # Kalshi prediction market command
+    kalshi_match = re.match(r'(?:kalshi|predict|prediction|market|markets)\s*(.*)', clean_text)
+    if kalshi_match:
+        query = kalshi_match.group(1).strip()
+
+        if not query:
+            # Show trending/popular markets
+            markets = fetch_kalshi_markets(limit=100)
+            if not markets:
+                say("Couldn't fetch Kalshi markets right now.")
+                return
+
+            # Sort by 24h volume
+            markets.sort(key=lambda m: float(m.get("volume_24h_fp", "0") or "0"), reverse=True)
+            top_markets = markets[:8]
+
+            lines = ["*Trending Prediction Markets (Kalshi):*\n"]
+            for market in top_markets:
+                lines.append(format_kalshi_market(market))
+                lines.append("")
+
+            say("\n".join(lines))
+            return
+
+        # Search for markets
+        markets = search_kalshi_markets(query)
+        if not markets:
+            say(f"No prediction markets found for '{query}'. Try different keywords.")
+            return
+
+        lines = [f"*Prediction Markets for '{query}':*\n"]
+        for market in markets[:8]:
+            lines.append(format_kalshi_market(market))
             lines.append("")
 
         say("\n".join(lines))
@@ -1023,9 +1450,64 @@ def handle_mention(event, say, client):
 
 
 @app.event("message")
-def handle_message(event, logger):
-    """Handle regular messages (for logging, not responding)."""
-    # We only respond to mentions, so this just prevents errors
+def handle_message(event, say, client):
+    """Handle regular messages, including file uploads."""
+    # Check if this message has files and mentions the bot
+    files = event.get("files", [])
+    text = event.get("text", "")
+    user_id = event.get("user")
+    channel_id = event.get("channel")
+
+    if not files:
+        return
+
+    # Check if it looks like a parlay request
+    text_lower = text.lower()
+    if not any(word in text_lower for word in ['parlay', 'bet', 'slip', 'ticket']):
+        return
+
+    # Look for stake amount in the message
+    stake_match = re.search(r'\$(\d+(?:\.\d{2})?)', text)
+    stake = stake_match.group(1) if stake_match else "10"
+
+    # Process image files
+    for file_info in files:
+        if file_info.get("mimetype", "").startswith("image/"):
+            try:
+                # Download the file
+                file_url = file_info.get("url_private_download") or file_info.get("url_private")
+                if not file_url:
+                    continue
+
+                headers = {"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+                resp = requests.get(file_url, headers=headers, timeout=30)
+
+                if resp.status_code != 200:
+                    say("Couldn't download the image. Make sure I have file access permissions.")
+                    continue
+
+                # For now, we'll ask the user to type out the legs
+                # (Full OCR would require additional dependencies)
+                say(f"Got your betting slip screenshot! To track this parlay, please type out the legs:\n\n"
+                    f"`@betbot parlay ${stake}`\n"
+                    f"```\n"
+                    f"Leg 1 pick +odds\n"
+                    f"Leg 2 pick -odds\n"
+                    f"...\n"
+                    f"```\n\n"
+                    f"Or if you want me to try parsing it, reply with `@betbot parse slip` "
+                    f"and describe what's on the slip.")
+                return
+
+            except Exception as e:
+                logger.error(f"Error processing file: {e}")
+                say("Had trouble processing that image. Try typing out your parlay instead.")
+                return
+
+
+@app.event("file_shared")
+def handle_file_shared(event, logger):
+    """Handle file shared events (prevents errors)."""
     pass
 
 
