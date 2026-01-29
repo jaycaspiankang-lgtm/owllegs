@@ -255,6 +255,15 @@ ESPN_SCOREBOARD = {
     'nhl': 'https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard',
 }
 
+ODDS_SPORTS = {
+    'nba': 'basketball/nba',
+    'nfl': 'football/nfl',
+    'mlb': 'baseball/mlb',
+    'nhl': 'hockey/nhl',
+    'ncaab': 'basketball/mens-college-basketball',
+    'ncaaf': 'football/college-football',
+}
+
 
 def fetch_scores(sport):
     """Fetch scores from ESPN."""
@@ -283,6 +292,82 @@ def fetch_scores(sport):
     except Exception as e:
         logger.error(f"Error fetching scores: {e}")
         return None
+
+
+def fetch_odds(sport):
+    """Fetch betting odds from ESPN."""
+    sport_path = ODDS_SPORTS.get(sport.lower())
+    if not sport_path:
+        return None
+
+    try:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        games = []
+
+        for event in data.get("events", [])[:8]:
+            competition = event.get("competitions", [{}])[0]
+            competitors = competition.get("competitors", [])
+
+            if len(competitors) < 2:
+                continue
+
+            home = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+            away = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+
+            game_info = {
+                "home": home.get("team", {}).get("displayName", ""),
+                "away": away.get("team", {}).get("displayName", ""),
+                "status": event.get("status", {}).get("type", {}).get("shortDetail", ""),
+                "spread": None,
+                "total": None,
+            }
+
+            # Get odds from competition
+            odds_list = competition.get("odds", [])
+            if odds_list:
+                odds = odds_list[0]
+                if odds.get("spread"):
+                    spread_val = odds.get("spread", 0)
+                    game_info["spread"] = f"{float(spread_val):+.1f}"
+
+                if odds.get("overUnder"):
+                    game_info["total"] = odds.get("overUnder")
+
+                details = odds.get("details", "")
+                if details:
+                    game_info["details"] = details
+
+            # Add score if game started
+            if competition.get("status", {}).get("type", {}).get("state") != "pre":
+                home_score = home.get("score", "0")
+                away_score = away.get("score", "0")
+                game_info["score"] = f"{away_score}-{home_score}"
+
+            games.append(game_info)
+
+        return games
+    except Exception as e:
+        logger.error(f"Error fetching odds: {e}")
+        return None
+
+
+def format_odds(game):
+    """Format game odds for display."""
+    lines = [f"*{game['away']} @ {game['home']}*"]
+    lines.append(f"  {game.get('status', '')}")
+
+    if game.get("score"):
+        lines.append(f"  Score: {game['score']}")
+    if game.get("spread"):
+        lines.append(f"  Spread: {game['spread']}")
+    if game.get("total"):
+        lines.append(f"  O/U: {game['total']}")
+    if game.get("details"):
+        lines.append(f"  {game['details']}")
+
+    return "\n".join(lines)
 
 
 def parse_betting_slip_ocr(ocr_lines):
@@ -344,9 +429,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/parlays - Your open parlays\n"
         "/parlay\\_won <id> - Mark as won\n"
         "/parlay\\_lost <id> - Mark as lost\n\n"
-        "*Scores:*\n"
+        "*Scores & Lines:*\n"
         "/scores nba - NBA scores\n"
-        "/scores nfl - NFL scores\n\n"
+        "/scores nfl - NFL scores\n"
+        "/lines nba - NBA betting lines/odds\n"
+        "/lines lakers - Search team lines\n\n"
         "*Screenshots:*\n"
         "Upload a betting slip image and I'll try to read it!\n",
         parse_mode='Markdown'
@@ -465,6 +552,53 @@ async def scores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 
+async def lines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /lines command for betting odds."""
+    query = context.args[0].lower() if context.args else 'nba'
+
+    if query in ODDS_SPORTS:
+        games = fetch_odds(query)
+        if not games:
+            await update.message.reply_text(f"No games/odds found for {query.upper()}")
+            return
+
+        lines = [f"*{query.upper()} Lines:*\n"]
+        for game in games:
+            lines.append(format_odds(game))
+            lines.append("")
+
+        await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+        return
+
+    # Search for team name across sports
+    all_games = []
+    for sport in ['nba', 'nfl', 'mlb', 'nhl']:
+        games = fetch_odds(sport)
+        if games:
+            for game in games:
+                game['sport'] = sport.upper()
+                all_games.append(game)
+
+    # Filter by team name
+    matching = []
+    for game in all_games:
+        if (query in game.get('home', '').lower() or
+            query in game.get('away', '').lower()):
+            matching.append(game)
+
+    if not matching:
+        await update.message.reply_text(f"No games found for '{query}'. Try a team name or sport (nba, nfl, mlb, nhl)")
+        return
+
+    lines = [f"*Lines for '{query}':*\n"]
+    for game in matching:
+        lines.append(f"_{game.get('sport', '')}:_")
+        lines.append(format_odds(game))
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle regular text messages."""
     text = update.message.text
@@ -579,6 +713,7 @@ def main():
     app.add_handler(CommandHandler("parlay_won", parlay_won))
     app.add_handler(CommandHandler("parlay_lost", parlay_lost))
     app.add_handler(CommandHandler("scores", scores_command))
+    app.add_handler(CommandHandler("lines", lines_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
