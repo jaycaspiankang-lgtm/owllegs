@@ -24,9 +24,21 @@ import re
 import sqlite3
 import logging
 import requests
+import io
 from datetime import datetime, timedelta
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+# Lazy load EasyOCR (heavy import)
+_ocr_reader = None
+
+def get_ocr_reader():
+    """Get or initialize the OCR reader."""
+    global _ocr_reader
+    if _ocr_reader is None:
+        import easyocr
+        _ocr_reader = easyocr.Reader(['en'], gpu=False)
+    return _ocr_reader
 
 # Configure logging
 logging.basicConfig(
@@ -1449,6 +1461,48 @@ _Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
     say("I didn't understand that. Try `@betbot help` for usage info.")
 
 
+def parse_betting_slip_ocr(ocr_text_lines):
+    """Parse OCR text from a betting slip into parlay legs."""
+    legs = []
+
+    # Join all text and split by common separators
+    full_text = "\n".join(ocr_text_lines)
+
+    # Common patterns in betting slips
+    # Look for lines with odds patterns
+    for line in ocr_text_lines:
+        line = line.strip()
+        if not line or len(line) < 3:
+            continue
+
+        # Skip common header/footer text
+        skip_words = ['parlay', 'total', 'wager', 'stake', 'potential', 'payout',
+                      'slip', 'ticket', 'placed', 'accepted', 'pending']
+        if any(word in line.lower() for word in skip_words):
+            continue
+
+        # Look for odds patterns in the line
+        odds_match = re.search(r'([+-]\d{3}|\d+\.\d+)', line)
+        if odds_match:
+            odds_str = odds_match.group(1)
+            pick = line[:odds_match.start()].strip()
+            if not pick:
+                pick = line[odds_match.end():].strip()
+            if pick:
+                legs.append({
+                    'pick': pick,
+                    'odds': parse_odds(odds_str)
+                })
+        # Also capture lines that look like picks (team names, over/under, etc.)
+        elif re.search(r'(over|under|spread|ml|moneyline|\+\d|\-\d)', line.lower()):
+            legs.append({
+                'pick': line,
+                'odds': 1.0  # Unknown odds
+            })
+
+    return legs
+
+
 @app.event("message")
 def handle_message(event, say, client):
     """Handle regular messages, including file uploads."""
@@ -1486,18 +1540,49 @@ def handle_message(event, say, client):
                     say("Couldn't download the image. Make sure I have file access permissions.")
                     continue
 
-                # For now, we'll ask the user to type out the legs
-                # (Full OCR would require additional dependencies)
-                say(f"Got your betting slip screenshot! To track this parlay, please type out the legs:\n\n"
-                    f"`@betbot parlay ${stake}`\n"
-                    f"```\n"
-                    f"Leg 1 pick +odds\n"
-                    f"Leg 2 pick -odds\n"
-                    f"...\n"
-                    f"```\n\n"
-                    f"Or if you want me to try parsing it, reply with `@betbot parse slip` "
-                    f"and describe what's on the slip.")
-                return
+                # Run OCR on the image
+                say("Reading your betting slip... (this may take a moment)")
+
+                try:
+                    from PIL import Image
+                    image = Image.open(io.BytesIO(resp.content))
+
+                    # Get OCR reader and process image
+                    reader = get_ocr_reader()
+                    results = reader.readtext(resp.content)
+
+                    # Extract text from OCR results
+                    ocr_lines = [text for (_, text, conf) in results if conf > 0.3]
+
+                    if not ocr_lines:
+                        say("Couldn't read any text from the image. Try a clearer screenshot or type out your parlay.")
+                        return
+
+                    # Parse the OCR text into legs
+                    legs = parse_betting_slip_ocr(ocr_lines)
+
+                    if not legs:
+                        # Show what we found and ask user to format it
+                        ocr_text = "\n".join(ocr_lines[:20])  # First 20 lines
+                        say(f"Here's what I read from the slip:\n```\n{ocr_text}\n```\n\n"
+                            f"I couldn't auto-parse the legs. Please type them out:\n"
+                            f"`@betbot parlay ${stake}`\n```\nPick1 +odds\nPick2 -odds\n```")
+                        return
+
+                    # Create the parlay
+                    user_name = get_user_name(client, user_id)
+                    parlay_id = add_parlay(user_id, user_name, channel_id, f"${stake}", legs, source="screenshot")
+
+                    parlay = get_parlay(parlay_id)
+                    say(f"Parlay #{parlay_id} created from your screenshot!\n\n{format_parlay(parlay)}\n\n"
+                        f"_If any legs are wrong, cancel with `@betbot parlay {parlay_id} cancel` and re-enter manually._")
+                    return
+
+                except Exception as ocr_error:
+                    logger.error(f"OCR error: {ocr_error}")
+                    say(f"Had trouble reading the image. Please type out your parlay:\n"
+                        f"`@betbot parlay ${stake}`\n```\nPick1 +odds\nPick2 -odds\n```")
+                    return
 
             except Exception as e:
                 logger.error(f"Error processing file: {e}")

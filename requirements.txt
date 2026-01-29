@@ -1,3 +1,5 @@
 slack-bolt
 slack-sdk
 requests
+easyocr
+pillow
