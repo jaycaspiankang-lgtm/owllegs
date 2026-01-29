@@ -661,8 +661,9 @@ async def parlay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             live_games = fetch_all_live_games()
 
             await update.message.reply_text(
-                f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay, live_data=live_games)}\n\n"
-                f"/check for live scores",
+                f"✅ *Parlay #{parlay_id} registered!*\n\n"
+                f"{format_parlay(parlay, live_data=live_games)}\n\n"
+                f"/check for live updates",
                 parse_mode='Markdown'
             )
             return
@@ -908,8 +909,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         live_games = fetch_all_live_games()
 
         await update.message.reply_text(
-            f"Parlay #{parlay_id} created!\n\n{format_parlay(parlay, live_data=live_games)}\n\n"
-            f"/check for live scores",
+            f"✅ *Parlay #{parlay_id} registered!*\n\n"
+            f"{format_parlay(parlay, live_data=live_games)}\n\n"
+            f"/check for live updates",
             parse_mode='Markdown'
         )
 
@@ -955,18 +957,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Look for stake in caption
+        # Look for stake in caption (optional)
         caption = update.message.caption or ""
         stake_match = re.search(r'\$(\d+(?:\.\d{2})?)', caption)
-        stake = stake_match.group(1) if stake_match else "10"
+        stake = stake_match.group(1) if stake_match else None
 
         # Create parlay
-        parlay_id = add_parlay(user.id, user.first_name, chat_id, f"${stake}", legs, source="screenshot")
+        parlay_id = add_parlay(user.id, user.first_name, chat_id, legs, stake=stake, source="screenshot")
         parlay = get_parlay(parlay_id)
 
+        # Get live scores for confirmation
+        live_games = fetch_all_live_games()
+
         await update.message.reply_text(
-            f"Parlay #{parlay_id} created from screenshot!\n\n{format_parlay(parlay)}\n\n"
-            f"_Wrong? Delete with /parlay\\_delete {parlay_id}_",
+            f"✅ *Parlay #{parlay_id} registered!*\n\n"
+            f"{format_parlay(parlay, live_data=live_games)}\n\n"
+            f"/check for live updates\n"
+            f"/parlay\\_won {parlay_id} or /parlay\\_lost {parlay_id} when done",
             parse_mode='Markdown'
         )
 
