@@ -497,35 +497,110 @@ def format_odds(game):
 
 
 def parse_betting_slip_ocr(ocr_lines):
-    """Parse OCR text from a betting slip."""
+    """Parse OCR text from a betting slip. Heavily filters noise."""
     legs = []
+
+    # Words/phrases to skip (UI elements, labels, etc.)
+    skip_words = [
+        # Betting app names
+        'draftkings', 'fanduel', 'betmgm', 'caesars', 'pointsbet', 'barstool',
+        'bet365', 'bovada', 'mybookie', 'betrivers', 'unibet', 'william hill',
+        # UI elements
+        'settings', 'balance', 'home', 'menu', 'profile', 'account', 'logout',
+        'login', 'sign', 'deposit', 'withdraw', 'cashout', 'cash out',
+        # Slip labels
+        'parlay', 'wager', 'stake', 'potential', 'payout', 'winnings', 'returns',
+        'slip', 'ticket', 'bet slip', 'my bets', 'open bets', 'settled',
+        'placed', 'accepted', 'pending', 'confirmed', 'processing',
+        # Status/time
+        'today', 'tomorrow', 'live', 'starting', 'final', 'ended', 'pm', 'am',
+        'est', 'pst', 'cst', 'edt', 'pdt',
+        # Other noise
+        'leg', 'legs', 'pick', 'picks', 'selection', 'selections',
+        'edit', 'remove', 'delete', 'add', 'share', 'copy',
+        'boost', 'boosted', 'promo', 'bonus', 'free', 'risk-free',
+        'odds', 'american', 'decimal', 'fractional',
+        'same game', 'sgp', 'single', 'straight',
+        'total payout', 'to win', 'risk', 'to return',
+    ]
+
+    # Patterns that indicate noise (not picks)
+    noise_patterns = [
+        r'^\$[\d,.]+$',  # Just a dollar amount
+        r'^[\d,.]+$',  # Just numbers
+        r'^\d{1,2}[:/]\d{2}',  # Time like 7:30 or 7/30
+        r'^\d{1,2}/\d{1,2}',  # Date like 1/29
+        r'^[A-Z]{2,3}$',  # Just 2-3 letter abbreviation alone
+        r'^\d+\s*legs?$',  # "3 legs" etc
+        r'^#\d+$',  # Ticket numbers
+    ]
+
+    # Words that suggest this IS a pick
+    pick_indicators = [
+        'ml', 'moneyline', 'spread', 'over', 'under', 'o/u',
+        'pts', 'points', 'to win', 'winner', 'total',
+        'alt', 'alternate', '1h', '2h', '1q', 'first half',
+        'rebounds', 'assists', 'strikeouts', 'touchdowns', 'yards',
+    ]
 
     for line in ocr_lines:
         line = line.strip()
-        if not line or len(line) < 3:
+
+        # Skip very short or very long lines
+        if len(line) < 3 or len(line) > 100:
             continue
 
-        skip_words = ['parlay', 'total', 'wager', 'stake', 'potential', 'payout',
-                      'slip', 'ticket', 'placed', 'accepted', 'pending']
-        if any(word in line.lower() for word in skip_words):
+        line_lower = line.lower()
+
+        # Skip if it matches noise patterns
+        if any(re.match(p, line) for p in noise_patterns):
             continue
 
-        odds_match = re.search(r'([+-]\d{3}|\d+\.\d+)', line)
+        # Skip if it contains skip words
+        if any(skip in line_lower for skip in skip_words):
+            continue
+
+        # Skip if it's just a single common word
+        common_single = ['the', 'and', 'for', 'with', 'from', 'this', 'that', 'your']
+        if line_lower in common_single:
+            continue
+
+        # Check if line has odds (strong indicator of a pick)
+        odds_match = re.search(r'([+-]\d{3}|\d+\.\d{2})', line)
+
+        # Check if line has pick indicators
+        has_pick_indicator = any(ind in line_lower for ind in pick_indicators)
+
+        # Check if line looks like a team/player name (capitalized words)
+        looks_like_name = bool(re.search(r'[A-Z][a-z]+', line))
+
+        # Accept if: has odds, OR has pick indicator, OR looks like a name with reasonable length
         if odds_match:
             odds_str = odds_match.group(1)
             pick = line[:odds_match.start()].strip()
             if not pick:
                 pick = line[odds_match.end():].strip()
-            if pick:
+
+            # Clean up the pick
+            pick = re.sub(r'^[-•*]\s*', '', pick)  # Remove bullets
+            pick = re.sub(r'[,;:]+$', '', pick)  # Remove trailing punctuation
+
+            if pick and len(pick) >= 3:
                 legs.append({
                     'pick': pick,
                     'odds': parse_odds(odds_str)
                 })
-        elif re.search(r'(over|under|spread|ml|moneyline)', line.lower()):
-            legs.append({
-                'pick': line,
-                'odds': 1.0
-            })
+
+        elif has_pick_indicator and looks_like_name:
+            # Clean up
+            pick = re.sub(r'^[-•*]\s*', '', line)
+            pick = re.sub(r'[,;:]+$', '', pick)
+
+            if len(pick) >= 5:  # Require slightly longer for non-odds lines
+                legs.append({
+                    'pick': pick,
+                    'odds': 1.0
+                })
 
     return legs
 
