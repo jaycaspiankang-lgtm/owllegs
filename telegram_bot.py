@@ -598,21 +598,19 @@ def fetch_nba_injuries():
         data = resp.json()
 
         injuries = []
-        for team in data.get('items', []):
-            team_name = team.get('team', {}).get('displayName', 'Unknown')
-            for player in team.get('injuries', []):
-                athlete = player.get('athlete', {})
+        for team_data in data.get('injuries', []):
+            team_name = team_data.get('team', {}).get('displayName', 'Unknown')
+            for injury in team_data.get('injuries', []):
+                athlete = injury.get('athlete', {})
                 name = athlete.get('displayName', 'Unknown')
-                status = player.get('status', 'Unknown')
-                injury_type = player.get('type', {}).get('description', '')
-                detail = player.get('details', {}).get('detail', '')
+                status = injury.get('status', 'Unknown')
+                injury_desc = injury.get('type', {}).get('description', '') or injury.get('description', '')
 
                 injuries.append({
                     'player': name,
                     'team': team_name,
                     'status': status,
-                    'injury': injury_type,
-                    'detail': detail
+                    'injury': injury_desc,
                 })
 
         return injuries
