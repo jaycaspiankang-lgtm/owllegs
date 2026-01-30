@@ -497,109 +497,103 @@ def format_odds(game):
 
 
 def parse_betting_slip_ocr(ocr_lines):
-    """Parse OCR text from a betting slip. Heavily filters noise."""
+    """Parse OCR text from a betting slip. Focuses on team names + lines."""
     legs = []
 
-    # Words/phrases to skip (UI elements, labels, etc.)
-    skip_words = [
-        # Betting app names
-        'draftkings', 'fanduel', 'betmgm', 'caesars', 'pointsbet', 'barstool',
-        'bet365', 'bovada', 'mybookie', 'betrivers', 'unibet', 'william hill',
-        # UI elements
-        'settings', 'balance', 'home', 'menu', 'profile', 'account', 'logout',
-        'login', 'sign', 'deposit', 'withdraw', 'cashout', 'cash out',
-        # Slip labels
-        'parlay', 'wager', 'stake', 'potential', 'payout', 'winnings', 'returns',
-        'slip', 'ticket', 'bet slip', 'my bets', 'open bets', 'settled',
-        'placed', 'accepted', 'pending', 'confirmed', 'processing',
-        # Status/time
-        'today', 'tomorrow', 'live', 'starting', 'final', 'ended', 'pm', 'am',
-        'est', 'pst', 'cst', 'edt', 'pdt',
-        # Other noise
-        'leg', 'legs', 'pick', 'picks', 'selection', 'selections',
-        'edit', 'remove', 'delete', 'add', 'share', 'copy',
-        'boost', 'boosted', 'promo', 'bonus', 'free', 'risk-free',
-        'odds', 'american', 'decimal', 'fractional',
-        'same game', 'sgp', 'single', 'straight',
-        'total payout', 'to win', 'risk', 'to return',
+    # Known team names (partial matches OK)
+    teams = [
+        # NBA
+        'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'nets', 'knicks', 'sixers',
+        'bucks', 'suns', 'mavericks', 'mavs', 'clippers', 'nuggets', 'grizzlies',
+        'cavaliers', 'cavs', 'thunder', 'pelicans', 'timberwolves', 'wolves', 'kings',
+        'hawks', 'hornets', 'magic', 'pacers', 'pistons', 'raptors', 'wizards',
+        'spurs', 'jazz', 'trail blazers', 'blazers', 'rockets',
+        # NFL
+        'chiefs', 'eagles', 'cowboys', 'bills', 'ravens', '49ers', 'niners', 'dolphins',
+        'lions', 'packers', 'bengals', 'chargers', 'seahawks', 'steelers', 'rams',
+        'vikings', 'jaguars', 'jags', 'texans', 'colts', 'broncos', 'raiders', 'saints',
+        'patriots', 'pats', 'bears', 'falcons', 'cardinals', 'giants', 'jets', 'titans',
+        'panthers', 'browns', 'commanders', 'buccaneers', 'bucs',
+        # MLB
+        'yankees', 'dodgers', 'braves', 'astros', 'mets', 'phillies', 'padres',
+        'mariners', 'blue jays', 'orioles', 'rays', 'twins', 'guardians', 'rangers',
+        'red sox', 'white sox', 'cubs', 'brewers', 'cardinals', 'diamondbacks', 'dbacks',
+        'giants', 'reds', 'pirates', 'royals', 'tigers', 'athletics', 'angels', 'rockies', 'marlins', 'nationals',
+        # NHL
+        'bruins', 'avalanche', 'panthers', 'oilers', 'rangers', 'hurricanes', 'devils',
+        'maple leafs', 'leafs', 'lightning', 'stars', 'jets', 'wild', 'golden knights',
+        'knights', 'flames', 'kraken', 'penguins', 'pens', 'capitals', 'caps', 'canucks',
+        'islanders', 'isles', 'kings', 'blackhawks', 'hawks', 'blues', 'senators', 'sens',
+        'sabres', 'red wings', 'wings', 'ducks', 'coyotes', 'predators', 'preds', 'sharks',
+        # Soccer
+        'arsenal', 'chelsea', 'liverpool', 'man city', 'manchester city', 'man united',
+        'manchester united', 'tottenham', 'spurs', 'barcelona', 'real madrid', 'bayern',
+        'psg', 'juventus', 'inter', 'milan', 'dortmund', 'ajax', 'benfica', 'porto',
     ]
 
-    # Patterns that indicate noise (not picks)
-    noise_patterns = [
-        r'^\$[\d,.]+$',  # Just a dollar amount
-        r'^[\d,.]+$',  # Just numbers
-        r'^\d{1,2}[:/]\d{2}',  # Time like 7:30 or 7/30
-        r'^\d{1,2}/\d{1,2}',  # Date like 1/29
-        r'^[A-Z]{2,3}$',  # Just 2-3 letter abbreviation alone
-        r'^\d+\s*legs?$',  # "3 legs" etc
-        r'^#\d+$',  # Ticket numbers
-    ]
-
-    # Words that suggest this IS a pick
-    pick_indicators = [
-        'ml', 'moneyline', 'spread', 'over', 'under', 'o/u',
-        'pts', 'points', 'to win', 'winner', 'total',
-        'alt', 'alternate', '1h', '2h', '1q', 'first half',
-        'rebounds', 'assists', 'strikeouts', 'touchdowns', 'yards',
-    ]
+    # Combine all OCR text to search through
+    full_text = ' '.join(ocr_lines)
 
     for line in ocr_lines:
         line = line.strip()
-
-        # Skip very short or very long lines
-        if len(line) < 3 or len(line) > 100:
+        if len(line) < 3:
             continue
 
         line_lower = line.lower()
 
-        # Skip if it matches noise patterns
-        if any(re.match(p, line) for p in noise_patterns):
-            continue
+        # Look for team name + line pattern (e.g., "Lakers +3", "Chiefs -7.5", "Celtics ML")
+        # Pattern: Team name followed by spread/ML/over/under
+        bet_pattern = re.search(
+            r'([A-Za-z][A-Za-z\s\.\']+?)\s*([+-]?\d+\.?\d*|ML|ml|moneyline|over|under|o\d+\.?\d*|u\d+\.?\d*)\s*([+-]\d{2,3})?',
+            line, re.IGNORECASE
+        )
 
-        # Skip if it contains skip words
-        if any(skip in line_lower for skip in skip_words):
-            continue
+        if bet_pattern:
+            potential_team = bet_pattern.group(1).strip().lower()
+            line_info = bet_pattern.group(2).strip()
+            odds = bet_pattern.group(3)
 
-        # Skip if it's just a single common word
-        common_single = ['the', 'and', 'for', 'with', 'from', 'this', 'that', 'your']
-        if line_lower in common_single:
-            continue
+            # Check if this matches a known team
+            team_match = None
+            for team in teams:
+                if team in potential_team or potential_team in team:
+                    team_match = potential_team.title()
+                    break
 
-        # Check if line has odds (strong indicator of a pick)
-        odds_match = re.search(r'([+-]\d{3}|\d+\.\d{2})', line)
+            if team_match:
+                # Build the pick string
+                pick = f"{team_match} {line_info}"
+                odds_val = parse_odds(odds) if odds else 1.0
 
-        # Check if line has pick indicators
-        has_pick_indicator = any(ind in line_lower for ind in pick_indicators)
+                # Avoid duplicates
+                if not any(team_match.lower() in leg['pick'].lower() for leg in legs):
+                    legs.append({
+                        'pick': pick,
+                        'odds': odds_val
+                    })
+                continue
 
-        # Check if line looks like a team/player name (capitalized words)
-        looks_like_name = bool(re.search(r'[A-Z][a-z]+', line))
+        # Also check for over/under totals (e.g., "Over 220.5", "Under 45")
+        total_pattern = re.search(
+            r'(over|under|o|u)\s*(\d+\.?\d*)\s*([+-]\d{2,3})?',
+            line, re.IGNORECASE
+        )
 
-        # Accept if: has odds, OR has pick indicator, OR looks like a name with reasonable length
-        if odds_match:
-            odds_str = odds_match.group(1)
-            pick = line[:odds_match.start()].strip()
-            if not pick:
-                pick = line[odds_match.end():].strip()
+        if total_pattern:
+            ou_type = total_pattern.group(1).upper()
+            if ou_type in ('O', 'U'):
+                ou_type = 'Over' if ou_type == 'O' else 'Under'
+            total_num = total_pattern.group(2)
+            odds = total_pattern.group(3)
 
-            # Clean up the pick
-            pick = re.sub(r'^[-•*]\s*', '', pick)  # Remove bullets
-            pick = re.sub(r'[,;:]+$', '', pick)  # Remove trailing punctuation
+            pick = f"{ou_type} {total_num}"
+            odds_val = parse_odds(odds) if odds else 1.0
 
-            if pick and len(pick) >= 3:
+            # Avoid duplicates
+            if not any(pick.lower() in leg['pick'].lower() for leg in legs):
                 legs.append({
                     'pick': pick,
-                    'odds': parse_odds(odds_str)
-                })
-
-        elif has_pick_indicator and looks_like_name:
-            # Clean up
-            pick = re.sub(r'^[-•*]\s*', '', line)
-            pick = re.sub(r'[,;:]+$', '', pick)
-
-            if len(pick) >= 5:  # Require slightly longer for non-odds lines
-                legs.append({
-                    'pick': pick,
-                    'odds': 1.0
+                    'odds': odds_val
                 })
 
     return legs
@@ -785,6 +779,37 @@ async def parlay_lost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     update_parlay_status(parlay_id, 'lost')
     await update.message.reply_text(f"Parlay #{parlay_id} marked as LOST. Better luck next time!")
+
+
+async def parlay_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /parlay_delete command."""
+    if not context.args:
+        await update.message.reply_text("Usage: /parlay_delete <id>")
+        return
+
+    try:
+        parlay_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid parlay ID")
+        return
+
+    parlay = get_parlay(parlay_id)
+    if not parlay:
+        await update.message.reply_text(f"Parlay #{parlay_id} not found!")
+        return
+
+    if str(parlay['user_id']) != str(update.effective_user.id):
+        await update.message.reply_text("You can only delete your own parlays!")
+        return
+
+    # Delete from database
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("DELETE FROM parlays WHERE id = ?", (parlay_id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"Parlay #{parlay_id} deleted.")
 
 
 async def scores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1007,6 +1032,7 @@ def main():
     app.add_handler(CommandHandler("parlays", parlays_command))
     app.add_handler(CommandHandler("parlay_won", parlay_won))
     app.add_handler(CommandHandler("parlay_lost", parlay_lost))
+    app.add_handler(CommandHandler("parlay_delete", parlay_delete))
     app.add_handler(CommandHandler("scores", scores_command))
     app.add_handler(CommandHandler("lines", lines_command))
     app.add_handler(CommandHandler("check", check_command))
