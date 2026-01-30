@@ -493,6 +493,60 @@ def format_parlay(parlay):
 _darko_projections = {}
 _darko_last_updated = None
 
+# The Odds API key
+ODDS_API_KEY = "4dc7a4a974da09518d53c1b93ba7a4cd"
+
+
+def fetch_nba_player_props():
+    """Fetch NBA player props from The Odds API."""
+    try:
+        # First get today's games
+        events_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events?apiKey={ODDS_API_KEY}"
+        resp = requests.get(events_url, timeout=15)
+        events = resp.json()
+
+        all_props = []
+
+        # Get props for each game (limit to first 5 to save API calls)
+        for event in events[:5]:
+            event_id = event['id']
+            props_url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+            params = {
+                'apiKey': ODDS_API_KEY,
+                'regions': 'us',
+                'markets': 'player_points,player_assists',
+                'oddsFormat': 'american'
+            }
+
+            try:
+                props_resp = requests.get(props_url, params=params, timeout=15)
+                props_data = props_resp.json()
+
+                # Parse the props
+                for bookmaker in props_data.get('bookmakers', [])[:1]:  # Just first bookmaker
+                    for market in bookmaker.get('markets', []):
+                        market_key = market.get('key', '')
+                        for outcome in market.get('outcomes', []):
+                            player_name = outcome.get('description', '')
+                            line = outcome.get('point', 0)
+                            over_under = outcome.get('name', '')
+
+                            if player_name and line and over_under == 'Over':
+                                prop_type = 'pts' if 'points' in market_key else 'ast'
+                                all_props.append({
+                                    'player': player_name,
+                                    'type': prop_type,
+                                    'line': line
+                                })
+            except Exception as e:
+                logger.error(f"Error fetching props for event {event_id}: {e}")
+                continue
+
+        return all_props
+    except Exception as e:
+        logger.error(f"Error fetching NBA props: {e}")
+        return []
+
 
 def parse_darko_csv(csv_content):
     """Parse DARKO CSV content into a dictionary by player name."""
@@ -556,18 +610,79 @@ def compare_darko_to_props():
     if not _darko_projections:
         return None, "No DARKO data loaded. Upload the CSV first!"
 
-    players = list(_darko_projections.values())
+    # Fetch live prop lines
+    props = fetch_nba_player_props()
 
-    # Sort by points
-    top_pts = sorted(players, key=lambda x: x['pts'], reverse=True)[:15]
+    if not props:
+        # Fall back to just showing projections
+        players = list(_darko_projections.values())
+        top_pts = sorted(players, key=lambda x: x['pts'], reverse=True)[:15]
+        top_ast = sorted(players, key=lambda x: x['ast'], reverse=True)[:15]
+        return {
+            'top_pts': top_pts,
+            'top_ast': top_ast,
+            'edges_pts': [],
+            'edges_ast': [],
+            'last_updated': _darko_last_updated,
+            'props_found': False
+        }, None
 
-    # Sort by assists
-    top_ast = sorted(players, key=lambda x: x['ast'], reverse=True)[:15]
+    # Compare props to DARKO and find edges
+    edges_pts = []
+    edges_ast = []
+
+    for prop in props:
+        player_name = prop['player'].lower()
+        line = prop['line']
+        prop_type = prop['type']
+
+        # Find matching DARKO projection
+        darko = None
+        for key, val in _darko_projections.items():
+            # Match by last name or full name
+            if player_name in key or key in player_name:
+                darko = val
+                break
+            # Try matching last name
+            prop_last = player_name.split()[-1] if player_name else ''
+            darko_last = key.split()[-1] if key else ''
+            if prop_last == darko_last and len(prop_last) > 3:
+                darko = val
+                break
+
+        if darko:
+            if prop_type == 'pts':
+                darko_proj = darko['pts']
+                delta = darko_proj - line
+                edges_pts.append({
+                    'player': prop['player'],
+                    'team': darko.get('team', ''),
+                    'line': line,
+                    'darko': darko_proj,
+                    'delta': delta,
+                    'edge': 'OVER' if delta > 0 else 'UNDER'
+                })
+            elif prop_type == 'ast':
+                darko_proj = darko['ast']
+                delta = darko_proj - line
+                edges_ast.append({
+                    'player': prop['player'],
+                    'team': darko.get('team', ''),
+                    'line': line,
+                    'darko': darko_proj,
+                    'delta': delta,
+                    'edge': 'OVER' if delta > 0 else 'UNDER'
+                })
+
+    # Sort by absolute delta (biggest edges first)
+    edges_pts.sort(key=lambda x: abs(x['delta']), reverse=True)
+    edges_ast.sort(key=lambda x: abs(x['delta']), reverse=True)
 
     return {
-        'top_pts': top_pts,
-        'top_ast': top_ast,
-        'last_updated': _darko_last_updated
+        'edges_pts': edges_pts[:10],
+        'edges_ast': edges_ast[:10],
+        'last_updated': _darko_last_updated,
+        'props_found': True
     }, None
 
 
@@ -1517,28 +1632,45 @@ _Tip: Upload a betting slip screenshot to track parlays, or upload DARKO CSV for
         say("\n".join(lines))
         return
 
-    # Props command - show DARKO projections
+    # Props command - show DARKO projections vs prop lines
     if clean_text in ("props", "projections", "darko"):
+        say("Fetching prop lines and comparing to DARKO...")
+
         data, error = compare_darko_to_props()
 
         if error:
             say(error)
             return
 
-        lines = ["*DARKO Projections - Top Players*\n"]
+        lines = ["*DARKO vs Prop Lines - Biggest Edges*\n"]
 
         if data.get('last_updated'):
-            lines.append(f"_Data loaded: {data['last_updated'].strftime('%Y-%m-%d %H:%M')}_\n")
+            lines.append(f"_DARKO data: {data['last_updated'].strftime('%Y-%m-%d %H:%M')}_\n")
 
-        lines.append("*Top Points Projections:*")
-        for i, p in enumerate(data['top_pts'][:10], 1):
-            lines.append(f"{i}. {p['name']} ({p['team']}) - {p['pts']:.1f} PTS")
+        if data.get('props_found') and data.get('edges_pts'):
+            lines.append("*POINTS - Biggest Deltas:*")
+            for e in data['edges_pts'][:8]:
+                delta_str = f"+{e['delta']:.1f}" if e['delta'] > 0 else f"{e['delta']:.1f}"
+                lines.append(f"• {e['player']}: Line {e['line']} | DARKO {e['darko']:.1f} | *{e['edge']} ({delta_str})*")
 
-        lines.append("\n*Top Assists Projections:*")
-        for i, p in enumerate(data['top_ast'][:10], 1):
-            lines.append(f"{i}. {p['name']} ({p['team']}) - {p['ast']:.1f} AST")
+            lines.append("\n*ASSISTS - Biggest Deltas:*")
+            for e in data['edges_ast'][:8]:
+                delta_str = f"+{e['delta']:.1f}" if e['delta'] > 0 else f"{e['delta']:.1f}"
+                lines.append(f"• {e['player']}: Line {e['line']} | DARKO {e['darko']:.1f} | *{e['edge']} ({delta_str})*")
 
-        lines.append("\n_Upload DARKO CSV to update projections_")
+        elif data.get('top_pts'):
+            lines.append("_(No prop lines available - showing top projections)_\n")
+            lines.append("*Top Points Projections:*")
+            for i, p in enumerate(data['top_pts'][:10], 1):
+                lines.append(f"{i}. {p['name']} ({p['team']}) - {p['pts']:.1f} PTS")
+
+            lines.append("\n*Top Assists Projections:*")
+            for i, p in enumerate(data['top_ast'][:10], 1):
+                lines.append(f"{i}. {p['name']} ({p['team']}) - {p['ast']:.1f} AST")
+        else:
+            lines.append("No edges found. Make sure DARKO CSV is uploaded.")
+
+        lines.append("\n_Upload fresh DARKO CSV daily for best results_")
 
         say("\n".join(lines))
         return
