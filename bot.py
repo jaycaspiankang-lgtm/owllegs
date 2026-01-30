@@ -489,6 +489,88 @@ def format_parlay(parlay):
     return "\n".join(lines)
 
 
+# DARKO projections storage (in-memory, updated when CSV uploaded)
+_darko_projections = {}
+_darko_last_updated = None
+
+
+def parse_darko_csv(csv_content):
+    """Parse DARKO CSV content into a dictionary by player name."""
+    global _darko_projections, _darko_last_updated
+    import csv as csv_module
+    from io import StringIO
+
+    projections = {}
+    reader = csv_module.DictReader(StringIO(csv_content))
+
+    for row in reader:
+        player = row.get('Player', '').strip()
+        if player:
+            projections[player.lower()] = {
+                'name': player,
+                'team': row.get('Team', ''),
+                'minutes': float(row.get('Minutes', 0) or 0),
+                'pts': float(row.get('PTS', 0) or 0),
+                'ast': float(row.get('AST', 0) or 0),
+                'reb': float(row.get('DREB', 0) or 0) + float(row.get('OREB', 0) or 0),
+                'stl': float(row.get('STL', 0) or 0),
+                'blk': float(row.get('BLK', 0) or 0),
+            }
+
+    _darko_projections = projections
+    _darko_last_updated = datetime.now()
+    return len(projections)
+
+
+def fetch_nba_injuries():
+    """Fetch NBA injury report from ESPN."""
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+
+        injuries = []
+        for team in data.get('items', []):
+            team_name = team.get('team', {}).get('displayName', 'Unknown')
+            for player in team.get('injuries', []):
+                athlete = player.get('athlete', {})
+                name = athlete.get('displayName', 'Unknown')
+                status = player.get('status', 'Unknown')
+                injury_type = player.get('type', {}).get('description', '')
+
+                injuries.append({
+                    'player': name,
+                    'team': team_name,
+                    'status': status,
+                    'injury': injury_type,
+                })
+
+        return injuries
+    except Exception as e:
+        logger.error(f"Error fetching injuries: {e}")
+        return None
+
+
+def compare_darko_to_props():
+    """Compare DARKO projections to prop lines and find biggest edges."""
+    if not _darko_projections:
+        return None, "No DARKO data loaded. Upload the CSV first!"
+
+    players = list(_darko_projections.values())
+
+    # Sort by points
+    top_pts = sorted(players, key=lambda x: x['pts'], reverse=True)[:15]
+
+    # Sort by assists
+    top_ast = sorted(players, key=lambda x: x['ast'], reverse=True)[:15]
+
+    return {
+        'top_pts': top_pts,
+        'top_ast': top_ast,
+        'last_updated': _darko_last_updated
+    }, None
+
+
 # ESPN API for odds (they have betting data now)
 ODDS_SPORTS = {
     'nba': 'basketball/nba',
@@ -943,6 +1025,8 @@ def handle_mention(event, say, client):
 • `parlays` - Your open parlays
 • `parlay <id> won/lost/delete` - Mark result or delete
 • `check parlays` - Live scores for your parlays
+• `props` - DARKO projections (upload CSV first)
+• `injury` - NBA injury report
 • `settle <id> @winner` - Settle a bet
 • `cancel <id>` - Cancel a bet
 • `help` - Full help""")
@@ -976,12 +1060,14 @@ Over 220.5 -110```
 - `@betbot parlay <id> lost` - Mark parlay as lost
 - `@betbot parlay <id> delete` - Delete a parlay
 - `@betbot check parlays` - Live scores for your parlays
+- `@betbot props` - Show DARKO projections (PTS, AST)
+- `@betbot injury` - Show NBA injury report
 - `@betbot balance` - Check your balance
 - `@betbot balances` - Show everyone's balances
 - `@betbot myhistory` - Show your bet history
 - `@betbot help` - Show this help
 
-_Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
+_Tip: Upload a betting slip screenshot to track parlays, or upload DARKO CSV for projections!_""")
         return
 
     if clean_text in ("list", "bets", "open", "openbets", "open bets"):
@@ -1431,6 +1517,65 @@ _Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
         say("\n".join(lines))
         return
 
+    # Props command - show DARKO projections
+    if clean_text in ("props", "projections", "darko"):
+        data, error = compare_darko_to_props()
+
+        if error:
+            say(error)
+            return
+
+        lines = ["*DARKO Projections - Top Players*\n"]
+
+        if data.get('last_updated'):
+            lines.append(f"_Data loaded: {data['last_updated'].strftime('%Y-%m-%d %H:%M')}_\n")
+
+        lines.append("*Top Points Projections:*")
+        for i, p in enumerate(data['top_pts'][:10], 1):
+            lines.append(f"{i}. {p['name']} ({p['team']}) - {p['pts']:.1f} PTS")
+
+        lines.append("\n*Top Assists Projections:*")
+        for i, p in enumerate(data['top_ast'][:10], 1):
+            lines.append(f"{i}. {p['name']} ({p['team']}) - {p['ast']:.1f} AST")
+
+        lines.append("\n_Upload DARKO CSV to update projections_")
+
+        say("\n".join(lines))
+        return
+
+    # Injury command - show NBA injury report
+    if clean_text in ("injury", "injuries", "injury report"):
+        injuries = fetch_nba_injuries()
+
+        if not injuries:
+            say("Couldn't fetch injury report.")
+            return
+
+        # Group by status
+        out = [i for i in injuries if 'out' in i['status'].lower()]
+        doubtful = [i for i in injuries if 'doubtful' in i['status'].lower()]
+        questionable = [i for i in injuries if 'questionable' in i['status'].lower() or 'day-to-day' in i['status'].lower()]
+
+        lines = ["*NBA Injury Report*\n"]
+
+        if out:
+            lines.append("*OUT:*")
+            for i in out[:15]:
+                lines.append(f"• {i['player']} ({i['team']}) - {i['injury']}")
+
+        if doubtful:
+            lines.append("\n*DOUBTFUL:*")
+            for i in doubtful[:10]:
+                lines.append(f"• {i['player']} ({i['team']}) - {i['injury']}")
+
+        if questionable:
+            lines.append("\n*QUESTIONABLE/DTD:*")
+            for i in questionable[:15]:
+                lines.append(f"• {i['player']} ({i['team']}) - {i['injury']}")
+
+        say("\n".join(lines))
+        return
+
     # Settle command - flexible parsing
     # Use original text (not lowercased) to preserve user ID case
     text_no_bot = re.sub(f'<@{bot_user_id}>', '', text).strip()
@@ -1645,6 +1790,40 @@ def handle_message(event, say, client):
     # Look for stake amount in the message
     stake_match = re.search(r'\$(\d+(?:\.\d{2})?)', text)
     stake = stake_match.group(1) if stake_match else "10"
+
+    # Process CSV files (DARKO projections)
+    for file_info in files:
+        file_name = file_info.get("name", "")
+        if file_name.lower().endswith('.csv') or file_info.get("mimetype") == "text/csv":
+            try:
+                file_url = file_info.get("url_private_download") or file_info.get("url_private")
+                if not file_url:
+                    continue
+
+                headers = {"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+                resp = requests.get(file_url, headers=headers, timeout=30)
+
+                if resp.status_code != 200:
+                    say("Couldn't download the CSV file.")
+                    continue
+
+                csv_content = resp.content.decode('utf-8')
+
+                # Check if it looks like DARKO data
+                if 'Player' in csv_content and 'PTS' in csv_content:
+                    count = parse_darko_csv(csv_content)
+                    say(f"✅ DARKO projections loaded!\n"
+                        f"Parsed {count} players.\n\n"
+                        f"Use `@betbot props` to see top projections.")
+                else:
+                    say("This doesn't look like DARKO data. "
+                        "Expected columns: Player, Team, PTS, AST, etc.")
+                return
+
+            except Exception as e:
+                logger.error(f"Error processing CSV: {e}")
+                say("Error processing CSV file.")
+                return
 
     # Process image files
     for file_info in files:

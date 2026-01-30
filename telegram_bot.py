@@ -496,6 +496,116 @@ def format_odds(game):
     return "\n".join(lines)
 
 
+# DARKO projections storage (in-memory, updated when CSV uploaded)
+_darko_projections = {}
+_darko_last_updated = None
+
+
+def parse_darko_csv(csv_content):
+    """Parse DARKO CSV content into a dictionary by player name."""
+    global _darko_projections, _darko_last_updated
+    import csv
+    from io import StringIO
+
+    projections = {}
+    reader = csv.DictReader(StringIO(csv_content))
+
+    for row in reader:
+        player = row.get('Player', '').strip()
+        if player:
+            projections[player.lower()] = {
+                'name': player,
+                'team': row.get('Team', ''),
+                'minutes': float(row.get('Minutes', 0) or 0),
+                'pts': float(row.get('PTS', 0) or 0),
+                'ast': float(row.get('AST', 0) or 0),
+                'reb': float(row.get('DREB', 0) or 0) + float(row.get('OREB', 0) or 0),
+                'stl': float(row.get('STL', 0) or 0),
+                'blk': float(row.get('BLK', 0) or 0),
+            }
+
+    _darko_projections = projections
+    _darko_last_updated = datetime.now()
+    return len(projections)
+
+
+def fetch_nba_injuries():
+    """Fetch NBA injury report from ESPN."""
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+
+        injuries = []
+        for team in data.get('items', []):
+            team_name = team.get('team', {}).get('displayName', 'Unknown')
+            for player in team.get('injuries', []):
+                athlete = player.get('athlete', {})
+                name = athlete.get('displayName', 'Unknown')
+                status = player.get('status', 'Unknown')
+                injury_type = player.get('type', {}).get('description', '')
+                detail = player.get('details', {}).get('detail', '')
+
+                injuries.append({
+                    'player': name,
+                    'team': team_name,
+                    'status': status,
+                    'injury': injury_type,
+                    'detail': detail
+                })
+
+        return injuries
+    except Exception as e:
+        logger.error(f"Error fetching injuries: {e}")
+        return None
+
+
+def fetch_nba_props():
+    """Fetch NBA player props from ESPN/odds sources."""
+    try:
+        # ESPN doesn't have great prop data, but we can try to get player stats
+        # For now, return sample structure - would need a proper props API
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+
+        props = []
+        for event in data.get('events', []):
+            competition = event.get('competitions', [{}])[0]
+            odds_list = competition.get('odds', [])
+
+            # ESPN doesn't expose player props in the main API
+            # We'd need a dedicated props source
+
+        return props
+    except Exception as e:
+        logger.error(f"Error fetching props: {e}")
+        return []
+
+
+def compare_darko_to_props(props_data=None):
+    """Compare DARKO projections to prop lines and find biggest edges."""
+    if not _darko_projections:
+        return None, "No DARKO data loaded. Upload the CSV first!"
+
+    # For now, return top projected scorers and assist leaders
+    # Real implementation would compare to actual prop lines
+
+    players = list(_darko_projections.values())
+
+    # Sort by points
+    top_pts = sorted(players, key=lambda x: x['pts'], reverse=True)[:15]
+
+    # Sort by assists
+    top_ast = sorted(players, key=lambda x: x['ast'], reverse=True)[:15]
+
+    return {
+        'top_pts': top_pts,
+        'top_ast': top_ast,
+        'last_updated': _darko_last_updated
+    }, None
+
+
 def parse_betting_slip_ocr(ocr_lines):
     """Parse OCR text from a betting slip. Focuses on team names + lines."""
     legs = []
@@ -629,6 +739,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scores nba - Live scores\n"
         "/lines nba - Betting lines/odds\n"
         "/lines lakers - Search team\n\n"
+        "*Props & Projections:*\n"
+        "/props - DARKO projections (PTS, AST)\n"
+        "/injury - NBA injury report\n"
+        "Upload DARKO CSV to update projections\n\n"
         "*Screenshots:*\n"
         "Upload a betting slip image to track it!\n",
         parse_mode='Markdown'
@@ -890,6 +1004,110 @@ async def lines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 
+async def props_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /props command - show DARKO projections vs prop lines."""
+    data, error = compare_darko_to_props()
+
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    lines = ["*DARKO Projections - Top Players*\n"]
+
+    if data.get('last_updated'):
+        lines.append(f"_Data loaded: {data['last_updated'].strftime('%Y-%m-%d %H:%M')}_\n")
+
+    lines.append("*Top Points Projections:*")
+    for i, p in enumerate(data['top_pts'][:10], 1):
+        lines.append(f"{i}. {p['name']} ({p['team']}) - {p['pts']:.1f} PTS")
+
+    lines.append("\n*Top Assists Projections:*")
+    for i, p in enumerate(data['top_ast'][:10], 1):
+        lines.append(f"{i}. {p['name']} ({p['team']}) - {p['ast']:.1f} AST")
+
+    lines.append("\n_Upload fresh DARKO CSV to update projections_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+async def injury_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /injury command - show NBA injury report."""
+    await update.message.reply_text("Fetching injury report...")
+
+    injuries = fetch_nba_injuries()
+
+    if not injuries:
+        await update.message.reply_text("Couldn't fetch injury report.")
+        return
+
+    # Group by status
+    out = [i for i in injuries if 'out' in i['status'].lower()]
+    doubtful = [i for i in injuries if 'doubtful' in i['status'].lower()]
+    questionable = [i for i in injuries if 'questionable' in i['status'].lower() or 'day-to-day' in i['status'].lower()]
+
+    lines = ["*NBA Injury Report*\n"]
+
+    if out:
+        lines.append("*OUT:*")
+        for i in out[:15]:
+            lines.append(f"• {i['player']} ({i['team']}) - {i['injury']}")
+
+    if doubtful:
+        lines.append("\n*DOUBTFUL:*")
+        for i in doubtful[:10]:
+            lines.append(f"• {i['player']} ({i['team']}) - {i['injury']}")
+
+    if questionable:
+        lines.append("\n*QUESTIONABLE/DTD:*")
+        for i in questionable[:15]:
+            lines.append(f"• {i['player']} ({i['team']}) - {i['injury']}")
+
+    # Telegram message limit
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n..."
+
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document uploads (DARKO CSV)."""
+    document = update.message.document
+    if not document:
+        return
+
+    file_name = document.file_name or ""
+
+    # Check if it's a CSV
+    if not file_name.lower().endswith('.csv'):
+        return
+
+    logger.info(f"CSV upload received: {file_name}")
+
+    try:
+        file = await context.bot.get_file(document.file_id)
+        file_bytes = await file.download_as_bytearray()
+        csv_content = file_bytes.decode('utf-8')
+
+        # Check if it looks like DARKO data
+        if 'Player' in csv_content and 'PTS' in csv_content:
+            count = parse_darko_csv(csv_content)
+            await update.message.reply_text(
+                f"✅ DARKO projections loaded!\n"
+                f"Parsed {count} players.\n\n"
+                f"Use /props to see top projections."
+            )
+        else:
+            await update.message.reply_text(
+                "This doesn't look like DARKO data. "
+                "Expected columns: Player, Team, PTS, AST, etc."
+            )
+
+    except Exception as e:
+        logger.error(f"Error processing CSV: {e}")
+        await update.message.reply_text("Error processing CSV file.")
+
+
 def looks_like_picks(text):
     """Check if text looks like betting picks."""
     text_lower = text.lower()
@@ -1036,8 +1254,11 @@ def main():
     app.add_handler(CommandHandler("scores", scores_command))
     app.add_handler(CommandHandler("lines", lines_command))
     app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(CommandHandler("props", props_command))
+    app.add_handler(CommandHandler("injury", injury_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     print("Telegram Bet Tracker bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
