@@ -941,7 +941,8 @@ def handle_mention(event, say, client):
 • `kalshi <query>` - Prediction markets
 • `parlay $amt` + legs - Track a parlay
 • `parlays` - Your open parlays
-• `parlay <id> won/lost` - Mark result
+• `parlay <id> won/lost/delete` - Mark result or delete
+• `check parlays` - Live scores for your parlays
 • `settle <id> @winner` - Settle a bet
 • `cancel <id>` - Cancel a bet
 • `help` - Full help""")
@@ -973,6 +974,8 @@ Over 220.5 -110```
 - `@betbot parlays` - Show your open parlays
 - `@betbot parlay <id> won` - Mark parlay as won
 - `@betbot parlay <id> lost` - Mark parlay as lost
+- `@betbot parlay <id> delete` - Delete a parlay
+- `@betbot check parlays` - Live scores for your parlays
 - `@betbot balance` - Check your balance
 - `@betbot balances` - Show everyone's balances
 - `@betbot myhistory` - Show your bet history
@@ -1205,8 +1208,8 @@ _Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
         say(f"Parlay #{parlay_id} added!\n\n{format_parlay(parlay)}")
         return
 
-    # Parlay won/lost commands
-    parlay_result_match = re.match(r'parlay\s+(\d+)\s+(won|win|lost|lose|push|pushed)', clean_text)
+    # Parlay won/lost/delete commands
+    parlay_result_match = re.match(r'parlay\s+(\d+)\s+(won|win|lost|lose|push|pushed|delete|cancel|remove)', clean_text)
     if parlay_result_match:
         parlay_id = int(parlay_result_match.group(1))
         result = parlay_result_match.group(2).lower()
@@ -1225,6 +1228,13 @@ _Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
         elif result in ('lost', 'lose'):
             update_parlay_status(parlay_id, 'lost')
             say(f"Parlay #{parlay_id} marked as LOST. Better luck next time!")
+        elif result in ('delete', 'cancel', 'remove'):
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            c.execute("DELETE FROM parlays WHERE id = ?", (parlay_id,))
+            conn.commit()
+            conn.close()
+            say(f"Parlay #{parlay_id} deleted.")
         else:
             update_parlay_status(parlay_id, 'pushed')
             say(f"Parlay #{parlay_id} marked as PUSHED.")
@@ -1373,6 +1383,54 @@ _Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
         say("\n".join(lines))
         return
 
+    # Check parlays - show parlays with live scores
+    if clean_text in ("check parlays", "parlay check", "check parlay", "parlays check"):
+        parlays = get_user_parlays(user_id, status='open')
+        if not parlays:
+            say("You have no open parlays!")
+            return
+
+        # Fetch live scores from all sports
+        all_games = []
+        for sport in ['nba', 'nfl', 'mlb', 'nhl']:
+            games = fetch_scores(sport)
+            if games:
+                all_games.extend(games)
+
+        lines = [f"*Live Parlay Status* ({len(all_games)} games tracked)\n"]
+
+        for parlay in parlays:
+            legs = json.loads(parlay['legs']) if isinstance(parlay['legs'], str) else parlay['legs']
+            lines.append(f"*Parlay #{parlay['id']}* - {parlay['user_name']}")
+            if parlay.get('stake'):
+                lines.append(f"Stake: {parlay['stake']} → Potential: {parlay['potential_payout']}")
+            lines.append(f"Legs ({len(legs)}):")
+
+            for i, leg in enumerate(legs, 1):
+                pick = leg['pick']
+                odds_str = f" ({leg.get('odds', '')})" if leg.get('odds') and leg.get('odds') != 1.0 else ""
+
+                # Try to match to live game
+                live_info = ""
+                pick_lower = pick.lower()
+                for game in all_games:
+                    home = game.get('home_team', '').lower()
+                    away = game.get('away_team', '').lower()
+                    if home in pick_lower or away in pick_lower or \
+                       any(word in pick_lower for word in home.split() if len(word) > 3) or \
+                       any(word in pick_lower for word in away.split() if len(word) > 3):
+                        score = f"{game.get('away_team', '')} {game.get('away_score', 0)} - {game.get('home_team', '')} {game.get('home_score', 0)}"
+                        status = game.get('status', '')
+                        live_info = f" → {score} ({status})"
+                        break
+
+                lines.append(f"  {i}. {pick}{odds_str}{live_info}")
+
+            lines.append("")
+
+        say("\n".join(lines))
+        return
+
     # Settle command - flexible parsing
     # Use original text (not lowercased) to preserve user ID case
     text_no_bot = re.sub(f'<@{bot_user_id}>', '', text).strip()
@@ -1462,43 +1520,99 @@ _Tip: Upload a screenshot of your betting slip and mention me to track it!_""")
 
 
 def parse_betting_slip_ocr(ocr_text_lines):
-    """Parse OCR text from a betting slip into parlay legs."""
+    """Parse OCR text from a betting slip. Focuses on team names + lines."""
     legs = []
 
-    # Join all text and split by common separators
-    full_text = "\n".join(ocr_text_lines)
+    # Known team names (partial matches OK)
+    teams = [
+        # NBA
+        'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'nets', 'knicks', 'sixers',
+        'bucks', 'suns', 'mavericks', 'mavs', 'clippers', 'nuggets', 'grizzlies',
+        'cavaliers', 'cavs', 'thunder', 'pelicans', 'timberwolves', 'wolves', 'kings',
+        'hawks', 'hornets', 'magic', 'pacers', 'pistons', 'raptors', 'wizards',
+        'spurs', 'jazz', 'trail blazers', 'blazers', 'rockets',
+        # NFL
+        'chiefs', 'eagles', 'cowboys', 'bills', 'ravens', '49ers', 'niners', 'dolphins',
+        'lions', 'packers', 'bengals', 'chargers', 'seahawks', 'steelers', 'rams',
+        'vikings', 'jaguars', 'jags', 'texans', 'colts', 'broncos', 'raiders', 'saints',
+        'patriots', 'pats', 'bears', 'falcons', 'cardinals', 'giants', 'jets', 'titans',
+        'panthers', 'browns', 'commanders', 'buccaneers', 'bucs',
+        # MLB
+        'yankees', 'dodgers', 'braves', 'astros', 'mets', 'phillies', 'padres',
+        'mariners', 'blue jays', 'orioles', 'rays', 'twins', 'guardians', 'rangers',
+        'red sox', 'white sox', 'cubs', 'brewers', 'cardinals', 'diamondbacks', 'dbacks',
+        'giants', 'reds', 'pirates', 'royals', 'tigers', 'athletics', 'angels', 'rockies', 'marlins', 'nationals',
+        # NHL
+        'bruins', 'avalanche', 'panthers', 'oilers', 'rangers', 'hurricanes', 'devils',
+        'maple leafs', 'leafs', 'lightning', 'stars', 'jets', 'wild', 'golden knights',
+        'knights', 'flames', 'kraken', 'penguins', 'pens', 'capitals', 'caps', 'canucks',
+        'islanders', 'isles', 'kings', 'blackhawks', 'hawks', 'blues', 'senators', 'sens',
+        'sabres', 'red wings', 'wings', 'ducks', 'coyotes', 'predators', 'preds', 'sharks',
+        # Soccer
+        'arsenal', 'chelsea', 'liverpool', 'man city', 'manchester city', 'man united',
+        'manchester united', 'tottenham', 'spurs', 'barcelona', 'real madrid', 'bayern',
+        'psg', 'juventus', 'inter', 'milan', 'dortmund', 'ajax', 'benfica', 'porto',
+    ]
 
-    # Common patterns in betting slips
-    # Look for lines with odds patterns
     for line in ocr_text_lines:
         line = line.strip()
-        if not line or len(line) < 3:
+        if len(line) < 3:
             continue
 
-        # Skip common header/footer text
-        skip_words = ['parlay', 'total', 'wager', 'stake', 'potential', 'payout',
-                      'slip', 'ticket', 'placed', 'accepted', 'pending']
-        if any(word in line.lower() for word in skip_words):
-            continue
+        line_lower = line.lower()
 
-        # Look for odds patterns in the line
-        odds_match = re.search(r'([+-]\d{3}|\d+\.\d+)', line)
-        if odds_match:
-            odds_str = odds_match.group(1)
-            pick = line[:odds_match.start()].strip()
-            if not pick:
-                pick = line[odds_match.end():].strip()
-            if pick:
+        # Look for team name + line pattern (e.g., "Lakers +3", "Chiefs -7.5", "Celtics ML")
+        bet_pattern = re.search(
+            r'([A-Za-z][A-Za-z\s\.\']+?)\s*([+-]?\d+\.?\d*|ML|ml|moneyline|over|under|o\d+\.?\d*|u\d+\.?\d*)\s*([+-]\d{2,3})?',
+            line, re.IGNORECASE
+        )
+
+        if bet_pattern:
+            potential_team = bet_pattern.group(1).strip().lower()
+            line_info = bet_pattern.group(2).strip()
+            odds = bet_pattern.group(3)
+
+            # Check if this matches a known team
+            team_match = None
+            for team in teams:
+                if team in potential_team or potential_team in team:
+                    team_match = potential_team.title()
+                    break
+
+            if team_match:
+                pick = f"{team_match} {line_info}"
+                odds_val = parse_odds(odds) if odds else 1.0
+
+                # Avoid duplicates
+                if not any(team_match.lower() in leg['pick'].lower() for leg in legs):
+                    legs.append({
+                        'pick': pick,
+                        'odds': odds_val
+                    })
+                continue
+
+        # Also check for over/under totals (e.g., "Over 220.5", "Under 45")
+        total_pattern = re.search(
+            r'(over|under|o|u)\s*(\d+\.?\d*)\s*([+-]\d{2,3})?',
+            line, re.IGNORECASE
+        )
+
+        if total_pattern:
+            ou_type = total_pattern.group(1).upper()
+            if ou_type in ('O', 'U'):
+                ou_type = 'Over' if ou_type == 'O' else 'Under'
+            total_num = total_pattern.group(2)
+            odds = total_pattern.group(3)
+
+            pick = f"{ou_type} {total_num}"
+            odds_val = parse_odds(odds) if odds else 1.0
+
+            # Avoid duplicates
+            if not any(pick.lower() in leg['pick'].lower() for leg in legs):
                 legs.append({
                     'pick': pick,
-                    'odds': parse_odds(odds_str)
+                    'odds': odds_val
                 })
-        # Also capture lines that look like picks (team names, over/under, etc.)
-        elif re.search(r'(over|under|spread|ml|moneyline|\+\d|\-\d)', line.lower()):
-            legs.append({
-                'pick': line,
-                'odds': 1.0  # Unknown odds
-            })
 
     return legs
 
