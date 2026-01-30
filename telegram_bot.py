@@ -521,7 +521,7 @@ def fetch_nba_player_props():
             params = {
                 'apiKey': ODDS_API_KEY,
                 'regions': 'us',
-                'markets': 'player_points,player_assists',
+                'markets': 'player_points,player_assists,player_rebounds',
                 'oddsFormat': 'american'
             }
 
@@ -539,7 +539,14 @@ def fetch_nba_player_props():
                             over_under = outcome.get('name', '')
 
                             if player_name and line and over_under == 'Over':
-                                prop_type = 'pts' if 'points' in market_key else 'ast'
+                                if 'points' in market_key:
+                                    prop_type = 'pts'
+                                elif 'assists' in market_key:
+                                    prop_type = 'ast'
+                                elif 'rebounds' in market_key:
+                                    prop_type = 'reb'
+                                else:
+                                    continue
                                 all_props.append({
                                     'player': player_name,
                                     'type': prop_type,
@@ -655,6 +662,7 @@ def compare_darko_to_props(props_data=None):
             'top_ast': top_ast,
             'edges_pts': [],
             'edges_ast': [],
+            'edges_reb': [],
             'last_updated': _darko_last_updated,
             'props_found': False
         }, None
@@ -662,6 +670,7 @@ def compare_darko_to_props(props_data=None):
     # Compare props to DARKO and find edges
     edges_pts = []
     edges_ast = []
+    edges_reb = []
 
     for prop in props:
         player_name = prop['player'].lower()
@@ -705,14 +714,27 @@ def compare_darko_to_props(props_data=None):
                     'delta': delta,
                     'edge': 'OVER' if delta > 0 else 'UNDER'
                 })
+            elif prop_type == 'reb':
+                darko_proj = darko['reb']
+                delta = darko_proj - line
+                edges_reb.append({
+                    'player': prop['player'],
+                    'team': darko.get('team', ''),
+                    'line': line,
+                    'darko': darko_proj,
+                    'delta': delta,
+                    'edge': 'OVER' if delta > 0 else 'UNDER'
+                })
 
     # Sort by absolute delta (biggest edges first)
     edges_pts.sort(key=lambda x: abs(x['delta']), reverse=True)
     edges_ast.sort(key=lambda x: abs(x['delta']), reverse=True)
+    edges_reb.sort(key=lambda x: abs(x['delta']), reverse=True)
 
     return {
         'edges_pts': edges_pts[:10],
         'edges_ast': edges_ast[:10],
+        'edges_reb': edges_reb[:10],
         'last_updated': _darko_last_updated,
         'props_found': True
     }, None
@@ -1141,6 +1163,12 @@ async def props_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for e in data['edges_ast'][:8]:
             delta_str = f"+{e['delta']:.1f}" if e['delta'] > 0 else f"{e['delta']:.1f}"
             lines.append(f"• {e['player']}: Line {e['line']} | DARKO {e['darko']:.1f} | *{e['edge']} ({delta_str})*")
+
+        if data.get('edges_reb'):
+            lines.append("\n*REBOUNDS - Biggest Deltas:*")
+            for e in data['edges_reb'][:8]:
+                delta_str = f"+{e['delta']:.1f}" if e['delta'] > 0 else f"{e['delta']:.1f}"
+                lines.append(f"• {e['player']}: Line {e['line']} | DARKO {e['darko']:.1f} | *{e['edge']} ({delta_str})*")
 
     elif data.get('top_pts'):
         lines.append("_(No prop lines available - showing top projections)_\n")
