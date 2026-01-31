@@ -494,7 +494,7 @@ _darko_projections = {}
 _darko_last_updated = None
 
 # The Odds API key
-ODDS_API_KEY = "4dc7a4a974da09518d53c1b93ba7a4cd"
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 
 
 def fetch_nba_player_props():
