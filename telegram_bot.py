@@ -717,24 +717,75 @@ def compare_darko_to_props(props_data=None):
     edges_ast = []
     edges_reb = []
 
+    def find_darko_match(player_name):
+        """Find DARKO projection matching a player name, using full name matching."""
+        player_name = player_name.lower().strip()
+        player_parts = player_name.split()
+
+        if not player_parts:
+            return None
+
+        # 1. Try exact match first
+        if player_name in _darko_projections:
+            return _darko_projections[player_name]
+
+        # 2. Try matching with full name (first + last)
+        best_match = None
+        best_score = 0
+
+        for key, val in _darko_projections.items():
+            darko_parts = key.split()
+
+            # Exact full name match (case insensitive, already lowercase)
+            if key == player_name:
+                return val
+
+            # Check if first AND last name match
+            if len(player_parts) >= 2 and len(darko_parts) >= 2:
+                prop_first = player_parts[0]
+                prop_last = player_parts[-1]
+                darko_first = darko_parts[0]
+                darko_last = darko_parts[-1]
+
+                # Both first and last name must match (or be substrings)
+                first_match = (prop_first == darko_first or
+                              prop_first.startswith(darko_first) or
+                              darko_first.startswith(prop_first))
+                last_match = prop_last == darko_last
+
+                if first_match and last_match:
+                    # Calculate match score (prefer exact matches)
+                    score = 10 if prop_first == darko_first else 5
+                    score += 10 if prop_last == darko_last else 0
+                    if score > best_score:
+                        best_score = score
+                        best_match = val
+
+        if best_match:
+            return best_match
+
+        # 3. Last resort: only use last name if it's unique in DARKO data
+        if len(player_parts) >= 1:
+            prop_last = player_parts[-1]
+            matches_by_last = []
+            for key, val in _darko_projections.items():
+                darko_parts = key.split()
+                if darko_parts and darko_parts[-1] == prop_last:
+                    matches_by_last.append(val)
+
+            # Only use last name match if there's exactly one player with that last name
+            if len(matches_by_last) == 1:
+                return matches_by_last[0]
+
+        return None
+
     for prop in props:
-        player_name = prop["player"].lower()
+        player_name = prop["player"]
         line = prop["line"]
         prop_type = prop["type"]
 
         # Find matching DARKO projection
-        darko = None
-        for key, val in _darko_projections.items():
-            # Match by last name or full name
-            if player_name in key or key in player_name:
-                darko = val
-                break
-            # Try matching last name
-            prop_last = player_name.split()[-1] if player_name else ""
-            darko_last = key.split()[-1] if key else ""
-            if prop_last == darko_last and len(prop_last) > 3:
-                darko = val
-                break
+        darko = find_darko_match(player_name)
 
         if darko:
             if prop_type == "pts":
@@ -1646,7 +1697,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     print("Telegram Bet Tracker bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
