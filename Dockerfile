@@ -15,8 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-ENV CUDA_VISIBLE_DEVICES ""
-
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
