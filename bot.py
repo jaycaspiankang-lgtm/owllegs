@@ -668,7 +668,7 @@ def fetch_contract_hoopshype(player_name):
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         }
 
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
         if resp.status_code != 200:
             return None
 
@@ -685,39 +685,54 @@ def fetch_contract_hoopshype(player_name):
             "free_agent_year": ""
         }
 
-        # Find player name
-        name_elem = soup.find("h1", class_="name")
-        if name_elem:
-            contract_data["player_name"] = name_elem.get_text(strip=True)
+        # Find all tables and look for one with salary data
+        tables = soup.find_all("table")
+        current_year = datetime.now().year
 
-        # Find salary table
-        table = soup.find("table", class_="hh-salaries-player-table")
-        if table:
+        for table in tables:
             rows = table.find_all("tr")
             contract_years = []
-            current_year = datetime.now().year
+            team_found = ""
 
-            for row in rows[1:]:  # Skip header
-                cells = row.find_all("td")
-                if len(cells) >= 2:
-                    year = cells[0].get_text(strip=True)
-                    salary = cells[1].get_text(strip=True)
+            for row in rows:
+                text = row.get_text(strip=True)
 
-                    # Check if this is a future year
-                    year_match = re.match(r"(\d{4})", year)
-                    if year_match:
-                        year_int = int(year_match.group(1))
-                        if year_int >= current_year:
-                            contract_years.append(f"{year}: {salary}")
-                            if not contract_data["current_salary"] and year_int == current_year:
-                                contract_data["current_salary"] = salary
+                # Look for rows with year pattern (2024-25) and salary
+                year_match = re.search(r"(\d{4})-(\d{2})", text)
+                # Match salary - $52,627,153 format (dollar sign followed by digits and commas)
+                salary_match = re.search(r"\$([\d,]+)", text)
+
+                if year_match and salary_match:
+                    year_str = f"{year_match.group(1)}-{year_match.group(2)}"
+                    start_year = int(year_match.group(1))
+                    end_year = int("20" + year_match.group(2))  # 25 -> 2025
+                    salary = "$" + salary_match.group(1)
+
+                    # Look for team name
+                    if not team_found:
+                        team_patterns = r"(Lakers|Celtics|Warriors|Nets|Knicks|Bulls|Heat|Suns|Bucks|76ers|Sixers|Mavericks|Mavs|Clippers|Nuggets|Grizzlies|Pelicans|Hawks|Cavaliers|Cavs|Pistons|Pacers|Magic|Hornets|Wizards|Raptors|Thunder|Trail Blazers|Blazers|Kings|Spurs|Jazz|Timberwolves|Wolves|Rockets)"
+                        team_match = re.search(team_patterns, text, re.I)
+                        if team_match:
+                            team_found = team_match.group(1)
+
+                    # Include seasons that end in current year or later
+                    # e.g., 2025-26 season ends in 2026, so include if current_year <= 2026
+                    if end_year >= current_year:
+                        contract_years.append(f"{year_str}: {salary}")
+                        if not contract_data["current_salary"]:
+                            contract_data["current_salary"] = salary
 
             if contract_years:
                 contract_data["years_remaining"] = len(contract_years)
-                contract_data["contract_years"] = f"{len(contract_years)} years"
+                contract_data["contract_years"] = f"{len(contract_years)} year(s)"
                 contract_data["contract_details"] = "\n".join(contract_years)
-                last_year = contract_years[-1].split(":")[0]
-                contract_data["free_agent_year"] = last_year
+                contract_data["team"] = team_found
+                # Calculate free agent year (year after last contract year)
+                last_year_match = re.search(r"(\d{4})", contract_years[-1])
+                if last_year_match:
+                    fa_year = int(last_year_match.group(1)) + 1
+                    contract_data["free_agent_year"] = str(fa_year)
+                break
 
         if contract_data["current_salary"] or contract_data["years_remaining"]:
             cache_contract(contract_data)
