@@ -26,6 +26,8 @@ import logging
 import requests
 import io
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
+from urllib.parse import quote
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -90,6 +92,21 @@ def init_db():
             created_at TEXT,
             resolved_at TEXT,
             source TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS nba_contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_name TEXT,
+            player_name_lower TEXT,
+            team TEXT,
+            years_remaining INTEGER,
+            current_salary TEXT,
+            total_value TEXT,
+            contract_years TEXT,
+            contract_details TEXT,
+            free_agent_year TEXT,
+            updated_at TEXT
         )
     """)
     conn.commit()
@@ -473,6 +490,270 @@ def update_parlay_status(parlay_id, status, result=None):
     )
     conn.commit()
     conn.close()
+
+
+# =============================================================================
+# NBA Contract Functions
+# =============================================================================
+
+def get_cached_contract(player_name):
+    """Get cached contract from database."""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM nba_contracts WHERE player_name_lower = ?",
+        (player_name.lower(),)
+    )
+    row = c.fetchone()
+    conn.close()
+    if row:
+        # Check if cache is less than 7 days old
+        updated = datetime.fromisoformat(row["updated_at"])
+        if datetime.now() - updated < timedelta(days=7):
+            return dict(row)
+    return None
+
+
+def cache_contract(contract_data):
+    """Cache contract data in database."""
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    # Delete old entry if exists
+    c.execute(
+        "DELETE FROM nba_contracts WHERE player_name_lower = ?",
+        (contract_data["player_name"].lower(),)
+    )
+    c.execute(
+        """
+        INSERT INTO nba_contracts
+        (player_name, player_name_lower, team, years_remaining, current_salary,
+         total_value, contract_years, contract_details, free_agent_year, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            contract_data["player_name"],
+            contract_data["player_name"].lower(),
+            contract_data.get("team", ""),
+            contract_data.get("years_remaining", 0),
+            contract_data.get("current_salary", ""),
+            contract_data.get("total_value", ""),
+            contract_data.get("contract_years", ""),
+            contract_data.get("contract_details", ""),
+            contract_data.get("free_agent_year", ""),
+            datetime.now().isoformat()
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def fetch_nba_contract(player_name):
+    """Fetch NBA contract info from Spotrac."""
+    # First check cache
+    cached = get_cached_contract(player_name)
+    if cached:
+        return cached
+
+    try:
+        # Search Spotrac for player
+        search_url = f"https://www.spotrac.com/nba/search/{quote(player_name)}/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        }
+
+        resp = requests.get(search_url, headers=headers, timeout=10, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Check if we landed on a player page or search results
+        # If redirected to player page, URL will contain /nba/player/
+        if "/nba/player/" not in resp.url and "/nba/" in resp.url:
+            # Might be on a team page or direct player page with different URL
+            pass
+
+        # Try to find contract table
+        contract_data = {
+            "player_name": player_name,
+            "team": "",
+            "years_remaining": 0,
+            "current_salary": "",
+            "total_value": "",
+            "contract_years": "",
+            "contract_details": "",
+            "free_agent_year": ""
+        }
+
+        # Look for player name header
+        player_header = soup.find("h1")
+        if player_header:
+            contract_data["player_name"] = player_header.get_text(strip=True)
+
+        # Look for team
+        team_elem = soup.find("a", href=lambda x: x and "/nba/" in x and "/cap/" in x)
+        if team_elem:
+            contract_data["team"] = team_elem.get_text(strip=True)
+
+        # Look for contract summary section
+        # Spotrac has different page structures, try multiple selectors
+
+        # Try finding salary info from the page
+        salary_spans = soup.find_all("span", class_="info")
+        for span in salary_spans:
+            text = span.get_text(strip=True)
+            if "$" in text and ("M" in text or "K" in text or "," in text):
+                if not contract_data["current_salary"]:
+                    contract_data["current_salary"] = text
+
+        # Try to find contract table
+        tables = soup.find_all("table")
+        for table in tables:
+            rows = table.find_all("tr")
+            contract_years = []
+            for row in rows:
+                cells = row.find_all(["td", "th"])
+                if len(cells) >= 2:
+                    year_text = cells[0].get_text(strip=True)
+                    # Look for year pattern like "2024-25"
+                    if re.match(r"\d{4}-\d{2}", year_text):
+                        salary = cells[-1].get_text(strip=True) if len(cells) > 1 else ""
+                        if "$" in salary or salary.replace(",", "").replace("$", "").isdigit():
+                            contract_years.append(f"{year_text}: {salary}")
+
+            if contract_years:
+                contract_data["contract_details"] = "\n".join(contract_years)
+                contract_data["years_remaining"] = len(contract_years)
+                contract_data["contract_years"] = f"{len(contract_years)} years"
+                if contract_years:
+                    # Last year is free agent year
+                    last_year = contract_years[-1].split(":")[0]
+                    contract_data["free_agent_year"] = last_year
+                break
+
+        # Try alternate method - look for specific spotrac elements
+        cap_figure = soup.find("span", class_="cap-figure")
+        if cap_figure:
+            contract_data["current_salary"] = cap_figure.get_text(strip=True)
+
+        # Look for years remaining text
+        years_text = soup.find(text=re.compile(r"\d+\s*(?:year|yr)", re.I))
+        if years_text:
+            match = re.search(r"(\d+)\s*(?:year|yr)", str(years_text), re.I)
+            if match:
+                contract_data["years_remaining"] = int(match.group(1))
+
+        # Cache the result if we found something useful
+        if contract_data["current_salary"] or contract_data["years_remaining"]:
+            cache_contract(contract_data)
+            return contract_data
+
+        # If Spotrac didn't work well, try HoopsHype
+        return fetch_contract_hoopshype(player_name)
+
+    except Exception as e:
+        logger.error(f"Error fetching contract for {player_name}: {e}")
+        return None
+
+
+def fetch_contract_hoopshype(player_name):
+    """Fallback: Fetch contract from HoopsHype."""
+    try:
+        # Format name for URL: "LeBron James" -> "lebron-james"
+        name_slug = player_name.lower().replace(" ", "-").replace("'", "").replace(".", "")
+        url = f"https://hoopshype.com/player/{name_slug}/salary/"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        }
+
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        contract_data = {
+            "player_name": player_name,
+            "team": "",
+            "years_remaining": 0,
+            "current_salary": "",
+            "total_value": "",
+            "contract_years": "",
+            "contract_details": "",
+            "free_agent_year": ""
+        }
+
+        # Find player name
+        name_elem = soup.find("h1", class_="name")
+        if name_elem:
+            contract_data["player_name"] = name_elem.get_text(strip=True)
+
+        # Find salary table
+        table = soup.find("table", class_="hh-salaries-player-table")
+        if table:
+            rows = table.find_all("tr")
+            contract_years = []
+            current_year = datetime.now().year
+
+            for row in rows[1:]:  # Skip header
+                cells = row.find_all("td")
+                if len(cells) >= 2:
+                    year = cells[0].get_text(strip=True)
+                    salary = cells[1].get_text(strip=True)
+
+                    # Check if this is a future year
+                    year_match = re.match(r"(\d{4})", year)
+                    if year_match:
+                        year_int = int(year_match.group(1))
+                        if year_int >= current_year:
+                            contract_years.append(f"{year}: {salary}")
+                            if not contract_data["current_salary"] and year_int == current_year:
+                                contract_data["current_salary"] = salary
+
+            if contract_years:
+                contract_data["years_remaining"] = len(contract_years)
+                contract_data["contract_years"] = f"{len(contract_years)} years"
+                contract_data["contract_details"] = "\n".join(contract_years)
+                last_year = contract_years[-1].split(":")[0]
+                contract_data["free_agent_year"] = last_year
+
+        if contract_data["current_salary"] or contract_data["years_remaining"]:
+            cache_contract(contract_data)
+            return contract_data
+
+        return None
+
+    except Exception as e:
+        logger.error(f"Error fetching contract from HoopsHype for {player_name}: {e}")
+        return None
+
+
+def format_contract(contract):
+    """Format contract info for display."""
+    if not contract:
+        return "Contract info not found."
+
+    lines = [f"*{contract['player_name']}*"]
+
+    if contract.get("team"):
+        lines.append(f"Team: {contract['team']}")
+
+    if contract.get("current_salary"):
+        lines.append(f"Current Salary: {contract['current_salary']}")
+
+    if contract.get("years_remaining"):
+        lines.append(f"Years Remaining: {contract['years_remaining']}")
+
+    if contract.get("free_agent_year"):
+        lines.append(f"Free Agent: {contract['free_agent_year']}")
+
+    if contract.get("contract_details"):
+        lines.append("\n*Contract Breakdown:*")
+        lines.append(f"```{contract['contract_details']}```")
+
+    return "\n".join(lines)
 
 
 def parse_odds(odds_str):
@@ -1285,6 +1566,7 @@ def handle_mention(event, say, client):
 • `check parlays` - Live scores for your parlays
 • `props` - DARKO projections (upload CSV first)
 • `injury` - NBA injury report
+• `contract <player>` - NBA contract info
 • `settle <id> @winner` - Settle a bet
 • `cancel <id>` - Cancel a bet
 • `help` - Full help""")
@@ -1320,6 +1602,7 @@ Over 220.5 -110```
 - `@betbot check parlays` - Live scores for your parlays
 - `@betbot props` - Show DARKO projections (PTS, AST)
 - `@betbot injury` - Show NBA injury report
+- `@betbot contract <player>` - NBA player contract info
 - `@betbot balance` - Check your balance
 - `@betbot balances` - Show everyone's balances
 - `@betbot myhistory` - Show your bet history
@@ -1940,6 +2223,22 @@ _Tip: Upload a betting slip screenshot to track parlays, or upload DARKO CSV for
                 lines.append(f"• {i['player']} ({i['team']}) - {i['injury']}")
 
         say("\n".join(lines))
+        return
+
+    # Contract command - NBA player contract lookup
+    if clean_text.startswith("contract "):
+        player_name = clean_text[9:].strip()
+        if not player_name:
+            say("Usage: `contract <player name>`\nExample: `contract LeBron James`")
+            return
+
+        say(f"Looking up contract for {player_name}...")
+        contract = fetch_nba_contract(player_name)
+
+        if contract:
+            say(format_contract(contract))
+        else:
+            say(f"Couldn't find contract info for *{player_name}*. Try the full name (e.g., 'LeBron James' not 'LeBron').")
         return
 
     # Settle command - flexible parsing

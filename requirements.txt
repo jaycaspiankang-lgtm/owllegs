@@ -3,3 +3,4 @@ slack-sdk
 requests
 pillow
 python-telegram-bot
+beautifulsoup4
