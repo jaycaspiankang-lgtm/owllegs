@@ -1608,7 +1608,7 @@ Over 220.5 -110```
 - `@betbot myhistory` - Show your bet history
 - `@betbot help` - Show this help
 
-_Tip: Upload a betting slip screenshot to track parlays, or upload DARKO CSV for projections!_""")
+_Tip: Upload DARKO CSV for prop projections!_""")
         return
 
     if clean_text in ("list", "bets", "open", "openbets", "open bets"):
@@ -2640,94 +2640,14 @@ def handle_message(event, say, client):
                 say("Error processing CSV file.")
                 return
 
-    # Process image files
+    # Image/screenshot OCR is disabled - tell users to type parlays manually
     for file_info in files:
         if file_info.get("mimetype", "").startswith("image/"):
-            try:
-                # Download the file
-                file_url = file_info.get("url_private_download") or file_info.get(
-                    "url_private"
-                )
-                if not file_url:
-                    continue
-
-                headers = {
-                    "Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"
-                }
-                resp = requests.get(file_url, headers=headers, timeout=30)
-
-                if resp.status_code != 200:
-                    say(
-                        "Couldn't download the image. Make sure I have file access permissions."
-                    )
-                    continue
-
-                # Run OCR on the image
-                say("Reading your betting slip... (this may take a moment)")
-
-                try:
-                    from PIL import Image
-
-                    image = Image.open(io.BytesIO(resp.content))
-
-                    # Get OCR reader and process image
-                    reader = get_ocr_reader()
-                    results = reader.readtext(resp.content)
-
-                    # Extract text from OCR results
-                    ocr_lines = [text for (_, text, conf) in results if conf > 0.3]
-
-                    if not ocr_lines:
-                        say(
-                            "Couldn't read any text from the image. Try a clearer screenshot or type out your parlay."
-                        )
-                        return
-
-                    # Parse the OCR text into legs
-                    legs = parse_betting_slip_ocr(ocr_lines)
-
-                    if not legs:
-                        # Show what we found and ask user to format it
-                        ocr_text = "\n".join(ocr_lines[:20])  # First 20 lines
-                        say(
-                            f"Here's what I read from the slip:\n```\n{ocr_text}\n```\n\n"
-                            f"I couldn't auto-parse the legs. Please type them out:\n"
-                            f"`@betbot parlay ${stake}`\n```\nPick1 +odds\nPick2 -odds\n```"
-                        )
-                        return
-
-                    # Create the parlay
-                    user_name = get_user_name(client, user_id)
-                    parlay_id = add_parlay(
-                        user_id,
-                        user_name,
-                        channel_id,
-                        f"${stake}",
-                        legs,
-                        source="screenshot",
-                    )
-
-                    parlay = get_parlay(parlay_id)
-                    say(
-                        f"Parlay #{parlay_id} created from your screenshot!\n\n{format_parlay(parlay)}\n\n"
-                        f"_If any legs are wrong, cancel with `@betbot parlay {parlay_id} cancel` and re-enter manually._"
-                    )
-                    return
-
-                except Exception as ocr_error:
-                    logger.error(f"OCR error: {ocr_error}")
-                    say(
-                        f"Had trouble reading the image. Please type out your parlay:\n"
-                        f"`@betbot parlay ${stake}`\n```\nPick1 +odds\nPick2 -odds\n```"
-                    )
-                    return
-
-            except Exception as e:
-                logger.error(f"Error processing file: {e}")
-                say(
-                    "Had trouble processing that image. Try typing out your parlay instead."
-                )
-                return
+            say(
+                "Screenshot reading is currently disabled. Please type out your parlay:\n"
+                "`@betbot parlay $50`\n```\nPick1 +odds\nPick2 -odds\n```"
+            )
+            return
 
 
 @app.event("file_shared")
