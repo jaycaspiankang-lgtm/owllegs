@@ -26,7 +26,7 @@ import logging
 import requests
 import io
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from urllib.parse import quote
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -650,7 +650,12 @@ def fetch_nba_contract(player_name):
             return contract_data
 
         # If Spotrac didn't work well, try HoopsHype
-        return fetch_contract_hoopshype(player_name)
+        result = fetch_contract_hoopshype(player_name)
+        if result:
+            return result
+
+        # Final fallback: Basketball Reference
+        return fetch_contract_basketball_reference(player_name)
 
     except Exception as e:
         logger.error(f"Error fetching contract for {player_name}: {e}")
@@ -742,6 +747,145 @@ def fetch_contract_hoopshype(player_name):
 
     except Exception as e:
         logger.error(f"Error fetching contract from HoopsHype for {player_name}: {e}")
+        return None
+
+
+def fetch_contract_basketball_reference(player_name):
+    """Fallback: Fetch contract from Basketball Reference."""
+    try:
+        parts = player_name.strip().split()
+        if len(parts) < 2:
+            return None
+
+        first = parts[0].lower().replace("'", "").replace(".", "")
+        last = parts[-1].lower().replace("'", "").replace(".", "")
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        }
+
+        # Try different player ID suffixes to find the right player
+        for suffix in ["01", "02", "03", "04", "05"]:
+            player_id = f"{last[:5]}{first[:2]}{suffix}"
+            url = f"https://www.basketball-reference.com/players/{last[0]}/{player_id}.html"
+
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Verify this is the right player by checking name
+            name_elem = soup.find("h1")
+            if name_elem:
+                page_name = name_elem.get_text(strip=True).lower()
+                if first not in page_name or last not in page_name:
+                    continue
+
+            # Check if player is currently active (has recent season data)
+            page_text = soup.get_text()
+            if "2024-25" not in page_text and "2025-26" not in page_text:
+                continue
+
+            # Found the right player, now extract contract data
+            contract_data = {
+                "player_name": player_name,
+                "team": "",
+                "years_remaining": 0,
+                "current_salary": "",
+                "total_value": "",
+                "contract_years": "",
+                "contract_details": "",
+                "free_agent_year": ""
+            }
+
+            # Get proper name from page
+            if name_elem:
+                name_span = name_elem.find("span")
+                if name_span:
+                    contract_data["player_name"] = name_span.get_text(strip=True)
+
+            # Find current team from meta section
+            team_match = re.search(r"Team:\s*([A-Za-z\s]+?)(?:\n|$)", page_text)
+            if team_match:
+                contract_data["team"] = team_match.group(1).strip()
+
+            current_year = datetime.now().year
+            contract_years = []
+
+            # BBRef stores salary/contract data in HTML comments - need to parse them
+            comments = soup.find_all(string=lambda text: isinstance(text, Comment))
+            for comment in comments:
+                comment_text = str(comment)
+                # Look for contract table in comments
+                if "contract" in comment_text.lower() or "$" in comment_text:
+                    inner_soup = BeautifulSoup(comment_text, "html.parser")
+                    tables = inner_soup.find_all("table")
+                    for table in tables:
+                        rows = table.find_all("tr")
+
+                        # First check for header-based format (year in header, salary in data)
+                        header_row = table.find("tr", class_="thead")
+                        if header_row:
+                            headers = [th.get_text(strip=True) for th in header_row.find_all("th")]
+                            year_cols = {}
+                            for i, h in enumerate(headers):
+                                year_match = re.match(r"(\d{4})-(\d{2})", h)
+                                if year_match:
+                                    end_year = int("20" + year_match.group(2))
+                                    if end_year >= current_year:
+                                        year_cols[i] = h
+
+                            # Get salary from data rows
+                            for row in rows:
+                                if "thead" in row.get("class", []):
+                                    continue
+                                cells = row.find_all(["td", "th"])
+                                for col_idx, year_str in year_cols.items():
+                                    if col_idx < len(cells):
+                                        cell_text = cells[col_idx].get_text(strip=True)
+                                        salary_match = re.search(r"\$([\d,]+)", cell_text)
+                                        if salary_match:
+                                            salary = "$" + salary_match.group(1)
+                                            entry = f"{year_str}: {salary}"
+                                            if entry not in contract_years:
+                                                contract_years.append(entry)
+
+                        # Also check row-based format (year and salary in same row)
+                        for row in rows:
+                            text = row.get_text()
+                            year_match = re.search(r"(\d{4})-(\d{2})", text)
+                            salary_match = re.search(r"\$([\d,]+)", text)
+
+                            if year_match and salary_match:
+                                end_year = int("20" + year_match.group(2))
+                                if end_year >= current_year:
+                                    year_str = f"{year_match.group(1)}-{year_match.group(2)}"
+                                    salary = "$" + salary_match.group(1)
+                                    entry = f"{year_str}: {salary}"
+                                    if entry not in contract_years:
+                                        contract_years.append(entry)
+
+            # Sort contract years chronologically
+            contract_years.sort(key=lambda x: x[:7])
+
+            if contract_years:
+                contract_data["years_remaining"] = len(contract_years)
+                contract_data["contract_years"] = f"{len(contract_years)} year(s)"
+                contract_data["contract_details"] = "\n".join(contract_years)
+                contract_data["current_salary"] = contract_years[0].split(": ")[-1]
+                last_year_match = re.search(r"(\d{4})", contract_years[-1])
+                if last_year_match:
+                    fa_year = int(last_year_match.group(1)) + 1
+                    contract_data["free_agent_year"] = str(fa_year)
+
+                cache_contract(contract_data)
+                return contract_data
+
+        return None
+
+    except Exception as e:
+        logger.error(f"Error fetching contract from Basketball Reference for {player_name}: {e}")
         return None
 
 
